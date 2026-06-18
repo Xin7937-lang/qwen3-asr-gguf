@@ -1,0 +1,33 @@
+# Qwen3-ASR GGUF Server Dependencies
+# ====================================
+# Python 3.9+ recommended
+
+# ─── Core ────────────────────────────────────────────────────────────────
+llama-cpp-python>=0.3.0
+numpy>=1.24.0
+soundfile>=0.12.0
+
+# ─── Server ───────────────────────────────────────────────────────────────
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# ─── Model Download ───────────────────────────────────────────────────────
+huggingface-hub>=0.17.0
+
+# ─── Installation Notes ───────────────────────────────────────────────────
+#
+# 普通安装（CPU 模式）:
+#   pip install -r requirements.txt
+#
+# AMD GPU (Vulkan) 支持:
+#   CMAKE_ARGS="-DLLAMA_VULKAN=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
+#
+# 如果 Vulkan 编译失败，回退到 CPU 模式即可（设置 ASR_ENABLE_VULKAN=false）
+#
+# 前置条件:
+#   1. Python 3.9+
+#   2. Vulkan SDK (用于 AMD GPU): https://vulkan.lunarg.com/
+#   3. Visual Studio Build Tools (编译 llama-cpp-python 需要)
+#
