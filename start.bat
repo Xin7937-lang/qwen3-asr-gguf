@@ -81,8 +81,8 @@ echo    Starting Server
 echo ========================================
 echo.
 echo Server addresses:
-echo   Local:  http://localhost:8000
-echo   API docs: http://localhost:8000/docs
+echo   Local:  http://localhost:8001
+echo   API docs: http://localhost:8001/docs
 echo.
 echo Environment:
 echo   Vulkan: %ASR_ENABLE_VULKAN%

@@ -5,7 +5,7 @@ Qwen3-ASR GGUF Agent 客户端
 
 使用方法:
     from agent_client import ASRClient
-    client = ASRClient("http://192.168.50.230:8000")
+    client = ASRClient("http://192.168.50.230:8001")
     text = client.transcribe("audio.wav")
 """
 import requests
@@ -25,7 +25,7 @@ class ASRClient:
         - 兼容主服务 API
 
     示例:
-        >>> client = ASRClient("http://192.168.50.230:8000")
+        >>> client = ASRClient("http://192.168.50.230:8001")
         >>> text = client.transcribe("meeting.wav")
         >>> print(text)
     """
@@ -35,7 +35,7 @@ class ASRClient:
         初始化客户端
 
         参数:
-            server_url: ASR 服务地址，如 "http://192.168.50.230:8000"
+            server_url: ASR 服务地址，如 "http://192.168.50.230:8001"
             timeout: 请求超时时间（秒），长音频建议增大
         """
         self.server_url = server_url.rstrip("/")
@@ -205,7 +205,7 @@ if __name__ == "__main__":
     # ┌───────────────────────────────────┐
     # │  配置：改成你 Windows 主机的 IP     │
     # └───────────────────────────────────┘
-    SERVER_URL = "http://192.168.50.230:8000"
+    SERVER_URL = "http://192.168.50.230:8001"
 
     # 1. 创建客户端
     client = ASRClient(SERVER_URL)

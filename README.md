@@ -52,7 +52,7 @@ python download_model.py
 ```
 
 或手动下载：
-1. 访问 https://huggingface.co/HaujetZhao/Qwen3-ASR-0.6B-GGUF
+1. 访问 https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF
 2. 下载 `qwen3-asr-0.6b-Q4_K_M.gguf`
 3. 放到 `model/` 目录
 
@@ -60,12 +60,12 @@ python download_model.py
 
 访问 API 文档：
 ```
-http://localhost:8000/docs
+http://localhost:8001/docs
 ```
 
 或使用命令行测试：
 ```batch
-curl -X POST "http://localhost:8000/v1/transcribe" -F "file=@test.wav" -F "language=Chinese"
+curl -X POST "http://localhost:8001/v1/transcribe" -F "file=@test.wav" -F "language=Chinese"
 ```
 
 ## 依赖安装详解
@@ -180,7 +180,7 @@ set ASR_ENABLE_VULKAN=false
 from agent_client import ASRClient
 
 # 创建客户端
-client = ASRClient("http://192.168.50.230:8000")
+client = ASRClient("http://192.168.50.230:8001")
 
 # 简单用法
 text = client.transcribe("meeting.wav", language="Chinese")
@@ -201,7 +201,7 @@ print(f"Vulkan: {backend_info['vulkan_enabled']}")
 ### Agent 启动时等待服务
 
 ```python
-client = ASRClient("http://192.168.50.230:8000")
+client = ASRClient("http://192.168.50.230:8001")
 if not client.wait_for_service(max_wait=60):
     print("服务未就绪")
     exit(1)
@@ -218,7 +218,7 @@ if not client.wait_for_service(max_wait=60):
 | `ASR_N_CTX` | 4096 | 上下文窗口大小 |
 | `ASR_N_THREADS` | 0 | CPU 线程数 (0 = 自动) |
 | `ASR_HOST` | 0.0.0.0 | 服务监听地址 |
-| `ASR_PORT` | 8000 | 服务端口 |
+| `ASR_PORT` | 8001 | 服务端口 |
 | `ASR_MAX_FILE_SIZE_MB` | 500 | 最大文件大小 (MB) |
 | `ASR_MAX_CONCURRENCY` | 2 | 最大并发数 |
 
@@ -317,8 +317,8 @@ python download_model.py
 ### Q: 与 qwen3-asr-server 共存？
 
 **A:** 可以。两个项目完全独立：
-- **qwen3-asr-server**: CPU 或 NVIDIA GPU，端口 8000
-- **qwen3-asr-gguf**: AMD GPU (Vulkan)，端口 8000
+- **qwen3-asr-server**: CPU 或 NVIDIA GPU，端口 8001
+- **qwen3-asr-gguf**: AMD GPU (Vulkan)，端口 8001
 
 如果同时运行，修改端口：
 ```batch
@@ -344,6 +344,6 @@ start.bat
 ## 相关链接
 
 - [Qwen3-ASR 原始仓库](https://huggingface.co/Qwen/Qwen3-ASR)
-- [GGUF 模型](https://huggingface.co/HaujetZhao/Qwen3-ASR-0.6B-GGUF)
+- [GGUF 模型](https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF)
 - [llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
 - [Vulkan SDK](https://vulkan.lunarg.com/)

@@ -13,7 +13,7 @@ MODEL_FILE = os.getenv("ASR_MODEL_FILE", "qwen3-asr-0.6b-Q4_K_M.gguf")
 MODEL_PATH = MODEL_DIR / MODEL_FILE
 
 # Default HuggingFace model for download
-HF_MODEL_REPO = os.getenv("ASR_HF_MODEL_REPO", "HaujetZhao/Qwen3-ASR-0.6B-GGUF")
+HF_MODEL_REPO = os.getenv("ASR_HF_MODEL_REPO", "ggml-org/Qwen3-ASR-0.6B-GGUF")
 
 # ─── Vulkan/GPU Settings ─────────────────────────────────────────────────────
 # Enable Vulkan acceleration (requires Vulkan SDK and llama-cpp-python compiled with Vulkan)
@@ -48,7 +48,7 @@ PRE_EMPHASIS = float(os.getenv("ASR_PRE_EMPHASIS", "0.97"))
 
 # ─── Server ────────────────────────────────────────────────────────────────
 HOST = os.getenv("ASR_HOST", "0.0.0.0")
-PORT = int(os.getenv("ASR_PORT", "8000"))
+PORT = int(os.getenv("ASR_PORT", "8001"))
 MAX_FILE_SIZE_MB = int(os.getenv("ASR_MAX_FILE_SIZE_MB", "500"))
 MAX_CONCURRENCY = int(os.getenv("ASR_MAX_CONCURRENCY", "2"))
 

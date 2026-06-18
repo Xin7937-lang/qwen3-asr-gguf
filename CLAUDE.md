@@ -108,7 +108,7 @@ The server accepts both short codes (`zh`, `en`, `ja`) and full English names (`
 - **Model loaded once globally** (`_llm` in `main.py`) — lazy on first request
 - **Vulkan detection on startup**: Checks `vulkaninfo` availability via `config.check_vulkan_available()`
 - **Automatic fallback**: If Vulkan unavailable, `ENABLE_VULKAN` is auto-disabled and CPU mode used
-- **Model download**: Use `download_model.py` to download GGUF model from HuggingFace (`HaujetZhao/Qwen3-ASR-0.6B-GGUF`)
+- **Model download**: Use `download_model.py` to download GGUF model from HuggingFace (`ggml-org/Qwen3-ASR-0.6B-GGUF`)
 - **GGUF model format**: Quantized model (~480MB), requires llama-cpp-python to load
 
 ## Common Tasks
@@ -125,8 +125,8 @@ set ASR_N_GPU_LAYERS=20 && python main.py
 set ASR_N_CTX=8192 && python main.py
 
 # Test the server
-curl http://localhost:8000/
-curl -X POST "http://localhost:8000/v1/transcribe" -F "file=@test.mp3" -F "language=Chinese"
+curl http://localhost:8001/
+curl -X POST "http://localhost:8001/v1/transcribe" -F "file=@test.mp3" -F "language=Chinese"
 
 # Use the agent client (run from agent machine, not the server)
 python agent_client.py
@@ -144,17 +144,17 @@ All prefixed `ASR_*`. Key overrides:
 | `ASR_N_THREADS` | 0 | CPU threads (0 = auto) |
 | `ASR_LLAMA_BACKEND` | auto | Backend selection |
 | `ASR_HOST` | 0.0.0.0 | Server host |
-| `ASR_PORT` | 8000 | Server port |
+| `ASR_PORT` | 8001 | Server port |
 | `ASR_MAX_FILE_SIZE_MB` | 500 | Max file size |
 | `ASR_MAX_CONCURRENCY` | 2 | API concurrency limit |
 | `ASR_CHUNK_DURATION_S` | 30 | Chunk duration in seconds |
-| `ASR_HF_MODEL_REPO` | HaujetZhao/Qwen3-ASR-0.6B-GGUF | HuggingFace repo |
+| `ASR_HF_MODEL_REPO` | ggml-org/Qwen3-ASR-0.6B-GGUF | HuggingFace repo |
 
 ## Model Information
 
 - **Model**: Qwen3-ASR-0.6B-GGUF (quantized, ~480MB)
 - **Format**: GGUF (Q4_K_M quantization)
-- **HuggingFace**: `HaujetZhao/Qwen3-ASR-0.6B-GGUF`
+- **HuggingFace**: `ggml-org/Qwen3-ASR-0.6B-GGUF`
 - **Package**: `llama-cpp-python` (PyPI) provides `Llama()` class
 - **Languages**: 30 supported (same as Qwen3-ASR)
 
@@ -211,7 +211,7 @@ The server will start even without the model, but transcription will fail. Statu
 
 ## Firewall Configuration
 
-Port 8000 must be open for LAN agents — same as qwen3-asr-server:
+Port 8001 must be open for LAN agents — same as qwen3-asr-server:
 ```powershell
-New-NetFirewallRule -DisplayName "Qwen3-ASR GGUF" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "Qwen3-ASR GGUF" -Direction Inbound -LocalPort 8001 -Protocol TCP -Action Allow
 ```

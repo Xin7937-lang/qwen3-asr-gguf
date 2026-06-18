@@ -292,29 +292,94 @@ def _save_result(
     filename: str,
     text: str,
     result: dict,
+    segments: List[dict],
     processing_time: float,
 ):
-    """Save transcription result to output/ directory for recovery."""
-    base = Path(filename).stem
-    # Sanitize filename
-    safe_name = "".join(c if c.isalnum() or c in " _-." else "_" for c in base)
+    """Save transcription result with improved organization.
 
+    Creates:
+    - output/YYYYMMDD/file_HHMMSS.txt - Plain text
+    - output/YYYYMMDD/file_HHMMSS.json - Full result with segments
+    - output/YYYYMMDD/file_HHMMSS.meta.json - Metadata
+    - output/latest_index.json - Index of recent transcriptions (max 50)
+    """
+    # 1. 准备基本信息
+    base = Path(filename).stem
+    safe_name = "".join(c if c.isalnum() or c in " _-." else "_" for c in base)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(config.OUTPUT_DIR)
+    date_str = datetime.now().strftime("%Y%m%d")
+
+    # 2. 创建日期目录
+    out_dir = Path(config.OUTPUT_DIR) / date_str
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save plain text
+    # 3. 保存纯文本
     txt_path = out_dir / f"{safe_name}_{timestamp}.txt"
     txt_path.write_text(text, encoding="utf-8")
 
-    # Save full JSON
+    # 4. 保存完整 JSON（包含 segments）
+    json_data = {
+        **result,
+        "segments": segments,
+        "saved_at": datetime.now().isoformat(),
+    }
     json_path = out_dir / f"{safe_name}_{timestamp}.json"
     json_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
+        json.dumps(json_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    logger.info("Saved transcription to:\n  %s\n  %s", txt_path, json_path)
+    # 5. 保存元数据
+    meta_data = {
+        "id": f"{safe_name}_{timestamp}",
+        "original_filename": filename,
+        "file_size_mb": round(len(text.encode('utf-8')) / 1024 / 1024, 2),
+        "duration_s": result.get("duration_s", 0),
+        "language": result.get("language"),
+        "processing_time": processing_time,
+        "rtf": result.get("rtf", 0),
+        "timestamp": datetime.now().isoformat(),
+        "backend": config.LLAMA_BACKEND,
+        "segments_count": len(segments),
+        "files": {
+            "txt": str(txt_path.relative_to(Path.cwd())),
+            "json": str(json_path.relative_to(Path.cwd())),
+            "meta": str(out_dir / f"{safe_name}_{timestamp}.meta.json"),
+        },
+    }
+    meta_path = out_dir / f"{safe_name}_{timestamp}.meta.json"
+    meta_path.write_text(
+        json.dumps(meta_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 6. 更新最新索引
+    index_path = Path(config.OUTPUT_DIR) / "latest_index.json"
+    index = []
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, FileNotFoundError):
+            index = []
+
+    index.insert(0, {
+        "id": f"{safe_name}_{timestamp}",
+        "original_filename": filename,
+        "timestamp": datetime.now().isoformat(),
+        "duration_s": meta_data["duration_s"],
+        "language": meta_data["language"],
+        "txt_file": str(txt_path.relative_to(Path.cwd())),
+    })
+
+    # 只保留最近 50 条记录
+    index = index[:50]
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    logger.info("Saved transcription to:\n  %s\n  %s\n  %s",
+                txt_path, json_path, meta_path)
 
 
 # ─── Lifespan ────────────────────────────────────────────────────────────
@@ -449,8 +514,9 @@ async def transcribe(
         processing_time = time.time() - start_time
         logger.info("Done in %.1fs: %s", processing_time, result["text"][:80])
 
-        # Save a local copy for recovery
-        _save_result(file.filename, result["text"], result, processing_time)
+        # Save a local copy for recovery (always include segments in local save)
+        segments = result.get("segments", [])
+        _save_result(file.filename, result["text"], result, segments, processing_time)
 
         return TranscribeResponse(
             text=result["text"],

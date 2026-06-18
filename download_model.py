@@ -27,7 +27,7 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Model file info
-REPO_ID = os.getenv("ASR_HF_MODEL_REPO", "HaujetZhao/Qwen3-ASR-0.6B-GGUF")
+REPO_ID = os.getenv("ASR_HF_MODEL_REPO", "ggml-org/Qwen3-ASR-0.6B-GGUF")
 FILENAME = "qwen3-asr-0.6b-Q4_K_M.gguf"
 EXPECTED_SIZE_MB = 480  # ~480MB
 
