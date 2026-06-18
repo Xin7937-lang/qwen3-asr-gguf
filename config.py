@@ -9,7 +9,7 @@ from pathlib import Path
 
 # ─── Model ────────────────────────────────────────────────────────────────
 MODEL_DIR = Path(os.getenv("ASR_MODEL_DIR", str(Path(__file__).parent / "model")))
-MODEL_FILE = os.getenv("ASR_MODEL_FILE", "qwen3-asr-0.6b-Q4_K_M.gguf")
+MODEL_FILE = os.getenv("ASR_MODEL_FILE", "Qwen3-ASR-0.6B-Q8_0.gguf")
 MODEL_PATH = MODEL_DIR / MODEL_FILE
 
 # Default HuggingFace model for download
