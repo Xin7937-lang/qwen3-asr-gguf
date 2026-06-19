@@ -1,7 +1,5 @@
 """
-Download Qwen3-ASR GGUF model from HuggingFace.
-
-This script downloads the quantized GGUF model for llama-cpp-python inference.
+Download Qwen3-ASR GGUF model and mmproj from HuggingFace.
 
 Usage:
     python download_model.py
@@ -26,38 +24,48 @@ except ImportError:
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Model file info
 REPO_ID = os.getenv("ASR_HF_MODEL_REPO", "ggml-org/Qwen3-ASR-0.6B-GGUF")
-FILENAME = "qwen3-asr-0.6b-Q4_K_M.gguf"
-EXPECTED_SIZE_MB = 480  # ~480MB
+MODEL_FILE = "Qwen3-ASR-0.6B-Q8_0.gguf"
+MMPROJ_FILE = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
+
+FILES = [
+    (MODEL_FILE, 768),
+    (MMPROJ_FILE, 205),
+]
+
+
+def download_file(filename: str, expected_size_mb: int) -> str:
+    path = os.path.join(MODEL_DIR, filename)
+    if os.path.exists(path):
+        actual_size_mb = os.path.getsize(path) / 1024 / 1024
+        print(f"  {filename} already exists ({round(actual_size_mb, 2)}MB)")
+        return path
+
+    print(f"  Downloading {filename} (~{expected_size_mb}MB)...")
+    path = hf_hub_download(
+        repo_id=REPO_ID,
+        filename=filename,
+        local_dir=MODEL_DIR,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+    )
+    actual_size_mb = os.path.getsize(path) / 1024 / 1024
+    print(f"  ✓ {filename} saved ({round(actual_size_mb, 2)}MB)")
+    return path
+
 
 # ─── Download ─────────────────────────────────────────────────────────────
 print("=" * 60)
 print("  Qwen3-ASR GGUF Model Download")
 print("=" * 60)
 print(f"  Repo:    {REPO_ID}")
-print(f"  File:    {FILENAME}")
-print(f"  Size:    ~{EXPECTED_SIZE_MB}MB")
 print(f"  Save to: {MODEL_DIR}")
 print("=" * 60)
 print()
 
-# Check if already exists
-model_path = os.path.join(MODEL_DIR, FILENAME)
-if os.path.exists(model_path):
-    actual_size_mb = os.path.getsize(model_path) / 1024 / 1024
-    print(f"  Model already exists: {model_path}")
-    print(f"  Size: {round(actual_size_mb, 2)}MB")
-
-    confirm = input("\n  Download again? (y/N): ")
-    if confirm.lower() != 'y':
-        print("  Aborted.")
-        sys.exit(0)
-
 # Check proxy settings
 http_proxy = os.getenv("HTTP_PROXY")
 https_proxy = os.getenv("HTTPS_PROXY")
-
 if http_proxy or https_proxy:
     print("  Using proxy:")
     if http_proxy:
@@ -66,36 +74,17 @@ if http_proxy or https_proxy:
         print(f"    HTTPS_PROXY={https_proxy}")
     print()
 
-print("  Starting download...")
-print()
-
 try:
-    path = hf_hub_download(
-        repo_id=REPO_ID,
-        filename=FILENAME,
-        local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,
-        resume_download=True,
-    )
+    for filename, expected_size_mb in FILES:
+        download_file(filename, expected_size_mb)
 
-    # Verify download
-    if os.path.exists(path):
-        actual_size_mb = os.path.getsize(path) / 1024 / 1024
-        print()
-        print("=" * 60)
-        print("  ✓ Download Complete!")
-        print("=" * 60)
-        print(f"  Saved to: {path}")
-        print(f"  Size: {round(actual_size_mb, 2)}MB")
-        print("=" * 60)
-        print()
-        print("  You can now start the server:")
-        print("    start.bat")
-        print()
-    else:
-        print()
-        print("  ✗ Download failed: file not found at expected location")
-        sys.exit(1)
+    print()
+    print("=" * 60)
+    print("  ✓ All downloads complete!")
+    print("=" * 60)
+    print("  You can now start the server:")
+    print("    start.bat")
+    print("=" * 60)
 
 except KeyboardInterrupt:
     print()
@@ -112,8 +101,6 @@ except Exception as e:
     print("    2. Set proxy if behind a firewall:")
     print("       set HTTP_PROXY=http://127.0.0.1:7897")
     print("       set HTTPS_PROXY=http://127.0.0.1:7897")
-    print("    3. Download manually:")
-    print(f"       https://huggingface.co/{REPO_ID}/resolve/main/{FILENAME}")
-    print(f"       Then save to: {model_path}")
+    print(f"    3. Download manually from: https://huggingface.co/{REPO_ID}")
     print()
     sys.exit(1)

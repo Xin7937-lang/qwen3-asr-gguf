@@ -39,10 +39,6 @@ echo [3/6] Installing dependencies...
 pip install -r requirements.txt -q
 if errorlevel 1 (
     echo [WARNING] Some dependencies may have failed to install
-    echo [INFO] Check for llama-cpp-python installation issues
-    echo.
-    echo [TIP] For AMD Vulkan support, reinstall with:
-    echo   CMAKE_ARGS="-DLLAMA_VULKAN=on" pip install llama-cpp-python --force-reinstall --no-cache-dir
     echo.
 )
 
@@ -64,13 +60,13 @@ if errorlevel 1 (
 
 REM ─── Check model ──────────────────────────────────────────────────────
 echo [5/6] Checking model...
-python -c "import config; print('Model exists:', config.MODEL_PATH.exists())" 2>nul
+python -c "import config; print('Model exists:', config.MODEL_PATH.exists()); print('mmproj exists:', config.MMPROJ_PATH.exists())" 2>nul
 if errorlevel 1 (
     echo [INFO] Model not found
     echo [TIP] Download the model using: python download_model.py
     echo.
 ) else (
-    python -c "import config; print('  Model:', config.MODEL_PATH.name)"
+    python -c "import config; print('  Model:', config.MODEL_PATH.name); print('  mmproj:', config.MMPROJ_PATH.name)"
     python -c "import config; print('  Size:', round(config.MODEL_PATH.stat().st_size/1024/1024, 1) if config.MODEL_PATH.exists() else '0', 'MB')"
 )
 
@@ -83,6 +79,8 @@ echo.
 echo Server addresses:
 echo   Local:  http://localhost:8001
 echo   API docs: http://localhost:8001/docs
+echo.
+echo Internal llama-server: http://localhost:8080
 echo.
 echo Environment:
 echo   Vulkan: %ASR_ENABLE_VULKAN%

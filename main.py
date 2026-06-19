@@ -1,14 +1,14 @@
 """
 Qwen3-ASR GGUF Server (AMD GPU + Vulkan)
 ========================================
-Speech-to-text server using llama-cpp-python with GGUF quantized model.
+Speech-to-text server using llama.cpp's llama-server with GGUF model.
 Supports AMD GPU acceleration via Vulkan API.
 
 Features:
 - AMD GPU acceleration via Vulkan
 - CPU fallback when Vulkan unavailable
 - FastAPI compatible with qwen3-asr-server
-- Simplified FBank audio encoder (~80% accuracy)
+- Local result saving with recovery
 
 API Endpoints:
 - GET /         - Service status
@@ -16,22 +16,28 @@ API Endpoints:
 - POST /v1/transcribe - Transcribe audio file
 
 Environment Variables (ASR_* prefix):
-- ASR_ENABLE_VULKAN=true      - Enable Vulkan (default)
+- ASR_ENABLE_VULKAN=true      - Enable Vulkan GPU offloading (default: true)
 - ASR_N_GPU_LAYERS=-1         - GPU layers (-1 = all)
-- ASR_N_CTX=4096              - Context window
-- ASR_HOST=0.0.0.0            - Server host
-- ASR_PORT=8000               - Server port
+- ASR_N_CTX=4096              - llama-server context window
+- ASR_HOST=0.0.0.0            - FastAPI host
+- ASR_PORT=8001               - FastAPI port
+- ASR_LLAMA_SERVER_PORT=8080  - Internal llama-server port
 """
+import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
+import re
+import subprocess
 import time
-import tempfile
-from pathlib import Path
-from typing import Optional, List
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 
+import requests
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -48,9 +54,6 @@ logging.basicConfig(
 logger = logging.getLogger("qwen3-gguf")
 
 # ─── Language mapping ────────────────────────────────────────────────────
-# Qwen3-ASR 官方支持的 30 种语言（完整英文名）
-# 支持短代码（zh, en）和全称（Chinese, English）两种输入
-
 LANGUAGE_NAMES = {
     "Chinese", "English", "Cantonese", "Arabic", "German", "French",
     "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
@@ -60,7 +63,6 @@ LANGUAGE_NAMES = {
 }
 _CANONICAL = {n.lower(): n for n in LANGUAGE_NAMES}
 
-# 短代码 → 官方全称（方便用户传 "zh"、"en"）
 SHORT_TO_FULL = {
     "zh": "Chinese", "zh-cn": "Chinese", "zh-tw": "Chinese",
     "en": "English", "en-us": "English", "en-gb": "English",
@@ -81,194 +83,241 @@ SHORT_TO_FULL = {
 
 
 def normalize_language(lang: str | None) -> str | None:
-    """
-    统一语言参数为 Qwen3-ASR 官方全称。
-
-    接受：
-      - 短代码: "zh" → "Chinese"
-      - 官方全称: "Chinese" → "Chinese" (大小写不敏感)
-      - None: → None（自动检测）
-    """
+    """Normalize language input to Qwen3-ASR full English name."""
     if lang is None:
         return None
+    if not isinstance(lang, str):
+        return None
     key = lang.strip().lower()
-    # 1) 短代码
     if key in SHORT_TO_FULL:
         return SHORT_TO_FULL[key]
-    # 2) 官方全称（大小写不敏感）
     if key in _CANONICAL:
         return _CANONICAL[key]
-    # 3) 未知 → 传原值，Qwen3-ASR 会校验并报错
     return lang
 
 
-# ─── Model globals ────────────────────────────────────────────────────────
-_llm = None  # llama.cpp model
+# ─── llama-server subprocess ─────────────────────────────────────────────
+_llama_server_proc: Optional[subprocess.Popen] = None
 
 
-# ─── Llama.cpp LLM Loading ────────────────────────────────────────────────
+def _llama_server_url() -> str:
+    return f"http://{config.LLAMA_SERVER_HOST}:{config.LLAMA_SERVER_PORT}"
 
-def _load_llm():
-    """Load GGUF model via llama-cpp-python."""
-    global _llm
-    if _llm is not None:
-        return _llm
 
-    model_path = config.MODEL_PATH
-    if not model_path.exists():
-        # Try any .gguf file in model dir
-        gguf_files = list(config.MODEL_DIR.glob("*.gguf"))
-        if not gguf_files:
-            raise FileNotFoundError(
-                f"No GGUF model found in {config.MODEL_DIR}. "
-                f"Download from: https://huggingface.co/{config.HF_MODEL_REPO}"
-            )
-        model_path = gguf_files[0]
+def _start_llama_server() -> subprocess.Popen:
+    """Start the llama-server subprocess."""
+    global _llama_server_proc
 
-    logger.info("Loading GGUF model: %s", model_path)
+    if _llama_server_proc is not None and _llama_server_proc.poll() is None:
+        return _llama_server_proc
 
-    try:
-        from llama_cpp import Llama
-    except ImportError:
-        raise ImportError(
-            "llama-cpp-python not installed. Run:\n"
-            "  pip install llama-cpp-python\n"
-            "  # For AMD Vulkan support:\n"
-            '  CMAKE_ARGS="-DLLAMA_VULKAN=on" pip install llama-cpp-python --force-reinstall --no-cache-dir'
+    if not config.MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model not found: {config.MODEL_PATH}. "
+            f"Download from: https://huggingface.co/{config.HF_MODEL_REPO}"
+        )
+    if not config.MMPROJ_PATH.exists():
+        raise FileNotFoundError(
+            f"mmproj not found: {config.MMPROJ_PATH}. "
+            f"Download from: https://huggingface.co/{config.HF_MODEL_REPO}"
         )
 
+    ngl = config.N_GPU_LAYERS if config.ENABLE_VULKAN else 0
+    cmd = [
+        str(config.LLAMA_SERVER_BIN),
+        "-m", str(config.MODEL_PATH),
+        "--mmproj", str(config.MMPROJ_PATH),
+        "--host", config.LLAMA_SERVER_HOST,
+        "--port", str(config.LLAMA_SERVER_PORT),
+        "-ngl", str(ngl),
+        "-c", str(config.N_CTX),
+        "--no-warmup",
+    ]
+
+    logger.info("Starting llama-server: %s", " ".join(cmd))
     t0 = time.time()
-    _llm = Llama(
-        model_path=str(model_path),
-        n_ctx=config.N_CTX,
-        n_threads=config.N_THREADS if config.N_THREADS > 0 else None,
-        n_gpu_layers=config.N_GPU_LAYERS if config.ENABLE_VULKAN else 0,
-        verbose=config.VERBOSE_LLM,
+    _llama_server_proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+
+    # Wait for server to become ready
+    url = f"{_llama_server_url()}/health"
+    for i in range(120):  # up to 60s
+        if _llama_server_proc.poll() is not None:
+            stdout, _ = _llama_server_proc.communicate()
+            raise RuntimeError(f"llama-server exited early (code {_llama_server_proc.returncode}):\n{stdout[-2000:]}")
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        _llama_server_proc.terminate()
+        raise RuntimeError("llama-server did not become ready within 60s")
+
     elapsed = time.time() - t0
-    logger.info("GGUF model loaded in %.1fs", elapsed)
-    logger.info("  Backend: %s", config.LLAMA_BACKEND)
-    logger.info("  GPU Layers: %d", config.N_GPU_LAYERS if config.ENABLE_VULKAN else 0)
-    logger.info("  Context: %d", config.N_CTX)
-
-    return _llm
+    logger.info("llama-server ready on %s (started in %.1fs)", _llama_server_url(), elapsed)
+    return _llama_server_proc
 
 
-# ─── Transcribe Function ──────────────────────────────────────────────────
+def _stop_llama_server():
+    """Stop the llama-server subprocess."""
+    global _llama_server_proc
+    if _llama_server_proc is not None:
+        logger.info("Stopping llama-server")
+        try:
+            _llama_server_proc.terminate()
+            _llama_server_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _llama_server_proc.kill()
+            except Exception:
+                pass
+        _llama_server_proc = None
 
-def _transcribe_gguf(
+
+def _wait_for_llama_server(timeout: float = 5.0) -> bool:
+    """Check if llama-server is responsive."""
+    url = f"{_llama_server_url()}/health"
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+# ─── Transcription via llama-server ──────────────────────────────────────
+
+_QWEN3_ASR_RE = re.compile(r"language\s+(?P<lang>\S+?)<asr_text>(?P<text>.*)", re.DOTALL)
+
+# ─── Result cache for agent retry ───────────────────────────────────────
+# Cache completed transcription results by request_id so agents can
+# retrieve them if their initial request times out.
+_result_cache: dict[str, dict] = {}
+_RESULT_CACHE_MAX = 50
+
+
+def _cache_put(request_id: str, result: dict):
+    """Store a transcription result for later retrieval by the agent."""
+    _result_cache[request_id] = result
+    # Trim oldest entries when over capacity
+    if len(_result_cache) > _RESULT_CACHE_MAX:
+        for key in list(_result_cache.keys())[:-_RESULT_CACHE_MAX]:
+            _result_cache.pop(key, None)
+
+
+def _make_request_id(filename: str) -> str:
+    """Generate a deterministic request_id from filename + timestamp."""
+    raw = f"{filename}_{datetime.now().isoformat()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _transcribe_chunk(chunk_idx: int, wav_bytes: bytes, start_s: float, end_s: float) -> dict:
+    """Send one audio chunk to llama-server and return a segment."""
+    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Transcribe this audio."},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio_b64, "format": "wav"},
+                    },
+                ],
+            }
+        ],
+        "temperature": 0.0,
+        "n_predict": 512,
+        "stop": ["<|im_end|>"],
+    }
+
+    url = f"{_llama_server_url()}/v1/chat/completions"
+    r = requests.post(url, json=payload, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"llama-server error {r.status_code}: {r.text}")
+
+    data = r.json()
+    content = data["choices"][0]["message"]["content"].strip()
+
+    # Parse "language Chinese<asr_text>..."
+    match = _QWEN3_ASR_RE.match(content)
+    if match:
+        lang = match.group("lang").strip()
+        text = match.group("text").strip()
+    else:
+        lang = None
+        text = content
+
+    # Clean up possible trailing special tokens
+    text = text.replace("<|im_end|>", "").strip()
+
+    return {
+        "start": start_s,
+        "end": end_s,
+        "text": text,
+        "language": lang,
+    }
+
+
+def _transcribe_llama_server(
     audio_bytes: bytes,
     language: Optional[str] = None,
     word_timestamps: bool = False,
 ) -> dict:
-    """
-    Transcribe audio using GGUF model.
-
-    Args:
-        audio_bytes: Raw audio bytes
-        language: Language hint (optional)
-        word_timestamps: Whether to return segments
-
-    Returns:
-        Dict with text, language, segments, processing_time
-    """
-    llm = _load_llm()
-    lang = normalize_language(language)
-    t_start = time.time()
-
-    # ── Load and validate audio ───────────────────────────────────────────
+    """Transcribe audio using llama-server backend."""
     if not audio_encoder.validate_audio(audio_bytes, config.MAX_FILE_SIZE_MB):
         raise HTTPException(413, f"File too large. Max: {config.MAX_FILE_SIZE_MB}MB")
 
-    # Get audio info
     audio_info = audio_encoder.get_audio_info(audio_bytes)
     duration_s = audio_info["duration_s"]
     logger.info("Audio: %.1fs @ %dHz, %d channels", duration_s, audio_info["sample_rate"], audio_info["channels"])
 
-    # ── Load and preprocess audio ─────────────────────────────────────────
+    # Load and resample to 16kHz mono
     audio, sr = audio_encoder.load_audio(audio_bytes, target_sr=config.SAMPLE_RATE)
 
-    # ── Extract FBank features ───────────────────────────────────────────
-    features = audio_encoder.extract_fbank(
-        audio,
-        sr=sr,
-        n_mels=config.N_MELS,
-        n_fft=config.N_FFT,
-        pre_emphasis=config.PRE_EMPHASIS,
-    )
-    logger.info("Features extracted: %s (frames x mels)", features.shape)
-
-    # ── Chunk features for processing ────────────────────────────────────
-    chunks = audio_encoder.chunk_features(
-        features,
-        max_duration_s=config.CHUNK_DURATION_S,
-    )
+    # Chunk audio into ~30s WAV segments
+    chunks = audio_encoder.chunk_audio(audio, sr=sr, max_duration_s=config.CHUNK_DURATION_S)
 
     segments = []
-    total_chunks = len(chunks)
+    detected_lang = normalize_language(language)
+    t_start = time.time()
 
-    # ── Process each chunk ──────────────────────────────────────────────
-    for idx, start_frame, chunk_feats in enumerate(chunks):
+    for idx, start_s, end_s, wav_bytes in chunks:
         t_chunk = time.time()
-
-        # Flatten features for LLM input
-        # Note: This is a simplified interface. The actual Qwen3-ASR uses
-        # a specialized chat format. We use raw completion here.
-        feat_flat = chunk_feats.flatten().tolist()
-
-        # Build prompt with language hint
-        # The format should match Qwen3-ASR's expected input
-        prompt = "<|audio|>"
-        if lang:
-            prompt = f"<|audio|><|{lang}|>"
-
-        # Add features to prompt (simplified)
-        # In production, this should use the actual audio encoding format
-        prompt = prompt + "".join(f"[{f:.4f}]" for f in feat_flat[:100])
-
         try:
-            # Run LLM inference
-            result = llm(
-                prompt,
-                max_tokens=256,
-                temperature=0.0,  # Greedy decoding for consistency
-                echo=False,
-            )
-
-            text = result["choices"][0]["text"].strip()
-
+            segment = _transcribe_chunk(idx, wav_bytes, start_s, end_s)
+            text = segment["text"]
+            if segment.get("language"):
+                detected_lang = normalize_language(segment["language"]) or detected_lang
         except Exception as e:
-            logger.warning("Chunk %d inference failed: %s", idx + 1, e)
-            text = ""  # Skip failed chunks
+            logger.warning("Chunk %d failed: %s", idx + 1, e)
+            text = ""
+            segment = {"start": start_s, "end": end_s, "text": "", "language": None}
 
-        # Calculate chunk timing
-        frame_shift_ms = 10.0
-        chunk_start_s = start_frame * frame_shift_ms / 1000.0
-        chunk_end_s = min(
-            (start_frame + len(chunk_feats)) * frame_shift_ms / 1000.0,
-            duration_s,
-        )
         chunk_dur = time.time() - t_chunk
-
-        if text:  # Only add segments with text
-            segments.append({
-                "start": round(chunk_start_s, 2),
-                "end": round(chunk_end_s, 2),
-                "text": text,
-            })
-
+        if text:
+            segments.append(segment)
             logger.info(
                 "Chunk %d/%d (%.1fs-%.1fs) in %.1fs: %s",
-                idx + 1, total_chunks,
-                chunk_start_s, chunk_end_s,
-                chunk_dur,
-                text[:60],
+                idx + 1, len(chunks), start_s, end_s, chunk_dur, text[:60]
             )
 
     total_time = time.time() - t_start
     full_text = " ".join(s["text"] for s in segments).strip()
-
-    # Calculate processing stats
     rtf = total_time / duration_s if duration_s > 0 else 0
 
     logger.info(
@@ -278,7 +327,7 @@ def _transcribe_gguf(
 
     return {
         "text": full_text,
-        "language": lang,
+        "language": detected_lang,
         "segments": segments if word_timestamps else [],
         "processing_time": round(total_time, 2),
         "duration_s": round(duration_s, 2),
@@ -295,29 +344,18 @@ def _save_result(
     segments: List[dict],
     processing_time: float,
 ):
-    """Save transcription result with improved organization.
-
-    Creates:
-    - output/YYYYMMDD/file_HHMMSS.txt - Plain text
-    - output/YYYYMMDD/file_HHMMSS.json - Full result with segments
-    - output/YYYYMMDD/file_HHMMSS.meta.json - Metadata
-    - output/latest_index.json - Index of recent transcriptions (max 50)
-    """
-    # 1. 准备基本信息
+    """Save transcription result locally for recovery."""
     base = Path(filename).stem
     safe_name = "".join(c if c.isalnum() or c in " _-." else "_" for c in base)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     date_str = datetime.now().strftime("%Y%m%d")
 
-    # 2. 创建日期目录
     out_dir = Path(config.OUTPUT_DIR) / date_str
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. 保存纯文本
     txt_path = out_dir / f"{safe_name}_{timestamp}.txt"
     txt_path.write_text(text, encoding="utf-8")
 
-    # 4. 保存完整 JSON（包含 segments）
     json_data = {
         **result,
         "segments": segments,
@@ -329,11 +367,11 @@ def _save_result(
         encoding="utf-8",
     )
 
-    # 5. 保存元数据
+    meta_path = out_dir / f"{safe_name}_{timestamp}.meta.json"
     meta_data = {
         "id": f"{safe_name}_{timestamp}",
         "original_filename": filename,
-        "file_size_mb": round(len(text.encode('utf-8')) / 1024 / 1024, 2),
+        "file_size_mb": round(len(text.encode("utf-8")) / 1024 / 1024, 2),
         "duration_s": result.get("duration_s", 0),
         "language": result.get("language"),
         "processing_time": processing_time,
@@ -342,18 +380,16 @@ def _save_result(
         "backend": config.LLAMA_BACKEND,
         "segments_count": len(segments),
         "files": {
-            "txt": str(txt_path.relative_to(Path.cwd())),
-            "json": str(json_path.relative_to(Path.cwd())),
-            "meta": str(out_dir / f"{safe_name}_{timestamp}.meta.json"),
+            "txt": os.path.relpath(txt_path),
+            "json": os.path.relpath(json_path),
+            "meta": os.path.relpath(meta_path),
         },
     }
-    meta_path = out_dir / f"{safe_name}_{timestamp}.meta.json"
     meta_path.write_text(
         json.dumps(meta_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # 6. 更新最新索引
     index_path = Path(config.OUTPUT_DIR) / "latest_index.json"
     index = []
     if index_path.exists():
@@ -368,10 +404,9 @@ def _save_result(
         "timestamp": datetime.now().isoformat(),
         "duration_s": meta_data["duration_s"],
         "language": meta_data["language"],
-        "txt_file": str(txt_path.relative_to(Path.cwd())),
+        "txt_file": os.path.relpath(txt_path),
     })
 
-    # 只保留最近 50 条记录
     index = index[:50]
     index_path.write_text(
         json.dumps(index, ensure_ascii=False, indent=2),
@@ -386,47 +421,43 @@ def _save_result(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """服务生命周期：启动时预热模型"""
+    """Service lifespan: start llama-server, stop on shutdown."""
     logger.info("=" * 60)
-    logger.info("  Qwen3-ASR GGUF Server (v1.0)")
-    logger.info("  Backend: llama.cpp")
+    logger.info("  Qwen3-ASR GGUF Server (v2.0)")
     logger.info("=" * 60)
-    logger.info("Model: %s", config.MODEL_PATH)
-    logger.info("Backend: %s", config.LLAMA_BACKEND)
-    logger.info("Vulkan: %s", config.ENABLE_VULKAN)
+    logger.info("Model:      %s", config.MODEL_PATH)
+    logger.info("mmproj:     %s", config.MMPROJ_PATH)
+    logger.info("Backend:    %s", config.LLAMA_BACKEND)
+    logger.info("Vulkan:     %s", config.ENABLE_VULKAN)
     logger.info("GPU Layers: %d", config.N_GPU_LAYERS if config.ENABLE_VULKAN else 0)
-    logger.info("Context: %d", config.N_CTX)
-    logger.info("Concurrency: %d", config.MAX_CONCURRENCY)
-    logger.info("")
-    logger.info("API:    http://localhost:%d/docs", config.PORT)
+    logger.info("Context:    %d", config.N_CTX)
+    logger.info("API:        http://localhost:%d", config.PORT)
     logger.info("=" * 60)
 
-    # Check Vulkan if enabled
-    if config.ENABLE_VULKAN:
-        if config.check_vulkan_available():
-            logger.info("Vulkan SDK detected ✓")
-        else:
-            logger.warning("Vulkan SDK not found. CPU-only mode will be used.")
-            logger.warning("Install Vulkan SDK for AMD GPU acceleration:")
-            logger.warning("  https://vulkan.lunarg.com/")
+    if config.ENABLE_VULKAN and not config.check_vulkan_available():
+        logger.warning("Vulkan SDK not found. CPU-only mode will be used.")
 
-    logger.info("Warming up model...")
     try:
-        _load_llm()
-        logger.info("Model warmup complete")
+        _start_llama_server()
     except FileNotFoundError as e:
-        logger.error("Model not found: %s", e)
-        logger.error("Download model using: python download_model.py")
+        logger.error("Model/mmproj not found: %s", e)
+        logger.error("Download using: python download_model.py")
+        raise
     except Exception as e:
-        logger.warning("Model warmup failed, will retry on first request: %s", e)
+        logger.error("Failed to start llama-server: %s", e)
+        raise
 
     yield
+    _stop_llama_server()
     logger.info("Shutting down...")
 
 
 # ─── FastAPI App ─────────────────────────────────────────────────────────
 
-app = FastAPI(title="Qwen3-ASR GGUF", version="1.0", lifespan=lifespan)
+app = FastAPI(title="Qwen3-ASR GGUF", version="2.0", lifespan=lifespan)
+
+# Concurrency limiter for transcription requests (llama-server has limited slots)
+_transcribe_semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
 
 
 class TranscribeResponse(BaseModel):
@@ -436,22 +467,20 @@ class TranscribeResponse(BaseModel):
     processing_time: float
     duration_s: Optional[float] = None
     rtf: Optional[float] = None
+    request_id: Optional[str] = None
 
-
-# ─── Routes ──────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     """Service status and configuration."""
-    model_info = config.get_model_info()
     return {
         "status": "ok",
         "service": "Qwen3-ASR GGUF",
-        "version": "1.0",
+        "version": "2.0",
         "backend": "llama.cpp",
         "backend_type": config.LLAMA_BACKEND,
-        "model_loaded": _llm is not None,
-        "model_info": model_info,
+        "model_loaded": _wait_for_llama_server(timeout=2),
+        "model_info": config.get_model_info(),
         "vulkan_enabled": config.ENABLE_VULKAN,
         "vulkan_detected": config.check_vulkan_available(),
         "optimizations": {
@@ -467,9 +496,10 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {
-        "status": "healthy" if _llm is not None else "initializing",
-        "model_loaded": _llm is not None,
+        "status": "healthy" if _wait_for_llama_server(timeout=2) else "initializing",
+        "model_loaded": _wait_for_llama_server(timeout=2),
         "model_exists": config.MODEL_PATH.exists(),
+        "mmproj_exists": config.MMPROJ_PATH.exists(),
     }
 
 
@@ -478,90 +508,100 @@ async def transcribe(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     word_timestamps: bool = Form(False),
+    request_id: Optional[str] = Form(None),
 ):
     """
     Transcribe audio file using GGUF model.
 
     Args:
         file: Audio file (wav, mp3, m4a, etc.)
-        language: Language hint — full English name (Chinese, English, Japanese...)
-                 or short code (zh, en, ja...). If omitted, auto-detect.
+        language: Language hint — full English name or short code. Auto-detect if omitted.
         word_timestamps: Whether to return segment timestamps
-
-    Returns:
-        {
-            "text": "Transcribed text",
-            "language": "Chinese",
-            "segments": [...],
-            "processing_time": 1.23,
-            "duration_s": 60.5,
-            "rtf": 0.35
-        }
+        request_id: Client-generated ID for result retrieval if the request times out
     """
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
-    start_time = time.time()
+    # Use client's request_id or generate one
+    rid = request_id or _make_request_id(file.filename)
 
-    try:
-        content = await file.read()
-        file_size_mb = len(content) / 1024 / 1024
-        logger.info("Request: file=%s size=%.1fMB backend=%s", file.filename, file_size_mb, config.LLAMA_BACKEND)
+    async with _transcribe_semaphore:
+        start_time = time.time()
 
-        # Transcribe
-        result = _transcribe_gguf(content, language=language, word_timestamps=word_timestamps)
+        try:
+            content = await file.read()
+            file_size_mb = len(content) / 1024 / 1024
+            logger.info("Request: file=%s size=%.1fMB backend=%s request_id=%s",
+                        file.filename, file_size_mb, config.LLAMA_BACKEND, rid)
 
-        processing_time = time.time() - start_time
-        logger.info("Done in %.1fs: %s", processing_time, result["text"][:80])
+            result = _transcribe_llama_server(content, language=language, word_timestamps=word_timestamps)
 
-        # Save a local copy for recovery (always include segments in local save)
-        segments = result.get("segments", [])
-        _save_result(file.filename, result["text"], result, segments, processing_time)
+            processing_time = time.time() - start_time
+            logger.info("Done in %.1fs: %s", processing_time, result["text"][:80])
 
-        return TranscribeResponse(
-            text=result["text"],
-            language=result.get("language"),
-            segments=result.get("segments") if word_timestamps else None,
-            processing_time=processing_time,
-            duration_s=result.get("duration_s"),
-            rtf=result.get("rtf"),
-        )
+            segments = result.get("segments", [])
+            _save_result(file.filename, result["text"], result, segments, processing_time)
 
-    except HTTPException:
-        raise
-    except FileNotFoundError as e:
-        logger.error("Model not found: %s", e)
-        raise HTTPException(
-            500,
-            f"Model not found: {e}. Download using: python download_model.py"
-        )
-    except ImportError as e:
-        logger.error("Missing dependency: %s", e)
-        raise HTTPException(
-            500,
-            f"Missing dependency: {e}. Run: pip install llama-cpp-python"
-        )
-    except Exception as e:
-        logger.exception("Transcription failed")
-        raise HTTPException(500, f"Transcription failed: {e}")
+            # Cache for agent retry
+            cached = {
+                "text": result["text"],
+                "language": result.get("language"),
+                "segments": result.get("segments") if word_timestamps else [],
+                "processing_time": processing_time,
+                "duration_s": result.get("duration_s"),
+                "rtf": result.get("rtf"),
+                "request_id": rid,
+            }
+            _cache_put(rid, cached)
+
+            return TranscribeResponse(
+                text=result["text"],
+                language=result.get("language"),
+                segments=result.get("segments") if word_timestamps else None,
+                processing_time=processing_time,
+                duration_s=result.get("duration_s"),
+                rtf=result.get("rtf"),
+                request_id=rid,
+            )
+
+        except HTTPException:
+            raise
+        except FileNotFoundError as e:
+            logger.error("Model/mmproj not found: %s", e)
+            raise HTTPException(500, f"Model/mmproj not found: {e}")
+        except Exception as e:
+            logger.exception("Transcription failed")
+            raise HTTPException(500, f"Transcription failed: {e}")
 
 
 @app.post("/asr")
 async def transcribe_asr(file: UploadFile = File(...)):
     """Simplified endpoint (alias for /v1/transcribe)."""
-    return await transcribe(file)
+    return await transcribe(file=file)
+
+
+@app.get("/v1/transcribe/result/{request_id}")
+async def get_transcribe_result(request_id: str):
+    """
+    Retrieve a previously completed transcription result by request_id.
+
+    Used by the agent client after a timeout to fetch the result without
+    re-processing the audio. Results are cached in memory for recent requests.
+    """
+    cached = _result_cache.get(request_id)
+    if cached is None:
+        raise HTTPException(404, f"No cached result found for request_id: {request_id}")
+    return cached
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     logger.info("Starting Qwen3-ASR GGUF server (backend=%s)", config.LLAMA_BACKEND)
-
     uvicorn.run(
         "main:app",
         host=config.HOST,
         port=config.PORT,
-        limit_concurrency=config.MAX_CONCURRENCY,
         timeout_keep_alive=30,
         log_level="info",
     )

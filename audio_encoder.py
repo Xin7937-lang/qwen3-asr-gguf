@@ -1,40 +1,29 @@
 """
-Audio Encoder for Qwen3-ASR GGUF Server
-========================================
-Implements FBank (Filter Bank) feature extraction from audio.
-Simplified version - ~80% accuracy compared to full AuT encoder.
-
-Based on Qwen3-ASR's preprocessing pipeline.
+Audio utilities for Qwen3-ASR GGUF Server
+==========================================
+Loads, resamples, and chunks audio into WAV bytes for llama-server.
 """
+import io
+import logging
+import tempfile
+import os
+from pathlib import Path
+from typing import List, Tuple
+
 import numpy as np
 import soundfile as sf
-from pathlib import Path
-from typing import Optional, Tuple
-import logging
 
 logger = logging.getLogger("qwen3-gguf")
 
 
 def load_audio(audio_bytes: bytes, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
-    """
-    Load audio from bytes and resample to target sample rate.
-
-    Args:
-        audio_bytes: Raw audio bytes
-        target_sr: Target sample rate (default 16000 for Qwen3-ASR)
-
-    Returns:
-        (audio_array, sample_rate) tuple
-    """
-    import tempfile
-    import os
-
+    """Load audio from bytes and resample to target sample rate."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
     try:
-        data, sr = sf.read(tmp_path)
+        data, sr = sf.read(tmp_path, dtype="float32")
     finally:
         try:
             os.unlink(tmp_path)
@@ -48,22 +37,13 @@ def load_audio(audio_bytes: bytes, target_sr: int = 16000) -> Tuple[np.ndarray, 
     # Resample if needed
     if sr != target_sr:
         data = resample_audio(data, sr, target_sr)
+        sr = target_sr
 
-    return data, target_sr
+    return data, sr
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """
-    Resample audio using linear interpolation.
-
-    Args:
-        audio: Input audio array
-        orig_sr: Original sample rate
-        target_sr: Target sample rate
-
-    Returns:
-        Resampled audio array
-    """
+    """Resample audio using linear interpolation."""
     old_len = len(audio)
     new_len = int(old_len * target_sr / orig_sr)
     return np.interp(
@@ -74,174 +54,57 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 
 
 def normalize_audio(audio: np.ndarray) -> np.ndarray:
-    """
-    Normalize audio to [-1, 1] range.
-
-    Args:
-        audio: Input audio array
-
-    Returns:
-        Normalized audio array
-    """
+    """Normalize audio to [-1, 1] range."""
     max_val = np.abs(audio).max()
     if max_val > 1.0:
         audio = audio / max_val
     return audio
 
 
-def extract_fbank(
+def audio_to_wav_bytes(audio: np.ndarray, sr: int = 16000) -> bytes:
+    """Convert float audio array to 16-bit mono WAV bytes."""
+    audio = normalize_audio(audio)
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def chunk_audio(
     audio: np.ndarray,
     sr: int = 16000,
-    n_mels: int = 80,
-    n_fft: int = 512,
-    pre_emphasis: float = 0.97,
-    frame_length_ms: float = 25.0,
-    frame_shift_ms: float = 10.0,
-) -> np.ndarray:
-    """
-    Extract FBank (Filter Bank) features from audio.
-
-    Matches Qwen3-ASR's preprocessing pipeline.
-
-    Args:
-        audio: Input audio array (should be at target_sr)
-        sr: Sample rate
-        n_mels: Number of mel bands
-        n_fft: FFT size
-        pre_emphasis: Pre-emphasis coefficient
-        frame_length_ms: Frame length in milliseconds
-        frame_shift_ms: Frame shift in milliseconds
-
-    Returns:
-        FBank features of shape (n_frames, n_mels)
-    """
-    # Ensure audio is normalized
-    audio = normalize_audio(audio)
-
-    # Pre-emphasis
-    audio = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1])
-
-    # Frame parameters
-    frame_len = int(frame_length_ms * sr / 1000)
-    frame_shift = int(frame_shift_ms * sr / 1000)
-
-    # Number of frames
-    num_frames = (len(audio) - frame_len) // frame_shift + 1
-    if num_frames < 1:
-        logger.warning("Audio too short, returning empty features")
-        return np.zeros((1, n_mels), dtype=np.float32)
-
-    # Hamming window
-    window = np.hamming(frame_len)
-
-    # Mel filterbank matrix
-    mel_basis = _create_mel_basis(n_fft // 2 + 1, n_mels, sr)
-
-    # Extract features frame by frame
-    frames = []
-    for i in range(num_frames):
-        start = i * frame_shift
-        frame = audio[start:start + frame_len] * window
-
-        # FFT
-        spec = np.fft.rfft(frame, n=n_fft)
-        power = np.abs(spec) ** 2
-
-        # Mel filter
-        mel = np.dot(mel_basis, power)
-        mel = np.where(mel > 0, np.log(mel + 1e-10), -10.0)
-
-        frames.append(mel)
-
-    return np.array(frames, dtype=np.float32)
-
-
-def _create_mel_basis(n_fft_bins: int, n_mels: int, sr: int) -> np.ndarray:
-    """
-    Create Mel filterbank matrix.
-
-    Args:
-        n_fft_bins: Number of FFT bins
-        n_mels: Number of mel bands
-        sr: Sample rate
-
-    Returns:
-        Mel filterbank matrix of shape (n_mels, n_fft_bins)
-    """
-    # Convert Hz to Mel scale
-    mel_max = 2595 * np.log10(1 + sr / 2 / 700)
-
-    # Create equally spaced mel points
-    mel_points = np.linspace(0, mel_max, n_mels + 2)
-
-    # Convert back to Hz
-    hz_points = 700 * (10 ** (mel_points / 2595) - 1)
-
-    # Convert to FFT bin indices
-    bins = np.floor((n_fft_bins + 1) * hz_points / sr).astype(int)
-    bins = np.clip(bins, 0, n_fft_bins - 1)
-
-    # Create filterbank matrix
-    basis = np.zeros((n_mels, n_fft_bins))
-    for m in range(1, n_mels + 1):
-        left = bins[m - 1]
-        center = bins[m]
-        right = bins[m + 1]
-
-        if center > left:
-            basis[m - 1, left:center] = np.linspace(0, 1, center - left)
-        if right > center:
-            basis[m - 1, center:right] = np.linspace(1, 0, right - center)
-
-    return basis
-
-
-def chunk_features(
-    features: np.ndarray,
     max_duration_s: float = 30.0,
-    frame_shift_ms: float = 10.0,
-) -> list:
+    min_duration_s: float = 1.0,
+) -> List[Tuple[int, float, float, bytes]]:
     """
-    Chunk features into segments for processing.
-
-    Args:
-        features: FBank features of shape (n_frames, n_mels)
-        max_duration_s: Maximum duration per chunk in seconds
-        frame_shift_ms: Frame shift in milliseconds
+    Split audio into chunks and return WAV bytes for each chunk.
 
     Returns:
-        List of feature chunks, each as (chunk_idx, start_frame, chunk_array)
+        List of (chunk_idx, start_s, end_s, wav_bytes)
     """
-    max_frames = int(max_duration_s * 1000 / frame_shift_ms)
+    chunk_samples = int(max_duration_s * sr)
+    min_samples = int(min_duration_s * sr)
+    total_samples = len(audio)
 
     chunks = []
-    for start in range(0, len(features), max_frames):
-        end = start + max_frames
-        chunk = features[start:end]
-
-        # Skip very short trailing chunks (< 1 second)
-        if len(chunk) < int(1000 / frame_shift_ms):
+    for start in range(0, total_samples, chunk_samples):
+        end = min(start + chunk_samples, total_samples)
+        if end - start < min_samples:
             continue
+        chunk_audio_arr = audio[start:end]
+        wav_bytes = audio_to_wav_bytes(chunk_audio_arr, sr)
+        chunks.append((
+            len(chunks),
+            round(start / sr, 2),
+            round(end / sr, 2),
+            wav_bytes,
+        ))
 
-        chunks.append((len(chunks), start, chunk))
-
-    logger.info("Split %d frames into %d chunks", len(features), len(chunks))
+    logger.info("Split %ds audio into %d chunks (%.1fs each)", int(total_samples / sr), len(chunks), max_duration_s)
     return chunks
 
 
 def get_audio_info(audio_bytes: bytes) -> dict:
-    """
-    Get basic information about audio data.
-
-    Args:
-        audio_bytes: Raw audio bytes
-
-    Returns:
-        Dict with duration, sample_rate, channels info
-    """
-    import tempfile
-    import os
-
+    """Get basic information about audio data."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
@@ -263,19 +126,8 @@ def get_audio_info(audio_bytes: bytes) -> dict:
             pass
 
 
-# ─── Utility Functions ─────────────────────────────────────────────────────
-
 def validate_audio(audio_bytes: bytes, max_size_mb: int = 500) -> bool:
-    """
-    Validate audio file before processing.
-
-    Args:
-        audio_bytes: Raw audio bytes
-        max_size_mb: Maximum file size in MB
-
-    Returns:
-        True if valid, False otherwise
-    """
+    """Validate audio file before processing."""
     size_mb = len(audio_bytes) / 1024 / 1024
     if size_mb > max_size_mb:
         logger.error("Audio too large: %.1fMB (max: %dMB)", size_mb, max_size_mb)
@@ -289,23 +141,10 @@ def validate_audio(audio_bytes: bytes, max_size_mb: int = 500) -> bool:
 
 
 def estimate_processing_time(duration_s: float, backend: str = "vulkan") -> float:
-    """
-    Estimate processing time based on audio duration and backend.
-
-    Args:
-        duration_s: Audio duration in seconds
-        backend: Inference backend (vulkan, cpu, metal, cuda)
-
-    Returns:
-        Estimated processing time in seconds
-    """
-    # These are rough estimates based on testing
+    """Estimate processing time based on audio duration and backend."""
     if backend == "vulkan":
-        # AMD GPU with Vulkan: ~0.3x real-time
-        return duration_s * 0.3
+        return duration_s * 0.1
     elif backend in ("metal", "cuda"):
-        # NVIDIA/Apple GPU: ~0.2x real-time
-        return duration_s * 0.2
+        return duration_s * 0.08
     else:
-        # CPU: ~2-3x real-time
-        return duration_s * 2.5
+        return duration_s * 0.4

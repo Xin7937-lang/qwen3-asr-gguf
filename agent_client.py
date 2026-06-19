@@ -7,11 +7,21 @@ Qwen3-ASR GGUF Agent 客户端
     from agent_client import ASRClient
     client = ASRClient("http://192.168.50.230:8001")
     text = client.transcribe("audio.wav")
+
+超时策略:
+    RTF ≈ 0.3 (10分钟音频约需3分钟处理)
+    默认超时 = 音频时长 × 0.3 × 3 (3倍安全余量) + 30s 缓冲
+    优先从音频文件读取真实时长，失败则按文件大小估算
 """
+import hashlib
+import logging
 import requests
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any
+
+logger = logging.getLogger("asr-client")
 
 
 class ASRClient:
@@ -20,8 +30,8 @@ class ASRClient:
 
     GGUF 版本特性:
         - 支持 AMD GPU (Vulkan)
-        - 模型大小 ~480MB (Q4_K_M 量化)
-        - 准确率 ~80% (简化 FBank 编码器)
+        - 模型大小 ~768MB (Q8_0 量化)
+        - 基于 Qwen3-ASR 全量模型，识别准确率高
         - 兼容主服务 API
 
     示例:
@@ -78,6 +88,42 @@ class ASRClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _estimate_audio_duration(self, audio_path: str) -> Optional[float]:
+        """
+        估算音频时长（秒）。
+
+        优先用 soundfile 读取真实时长，失败则按文件大小粗略估算。
+        """
+        path = Path(audio_path)
+        if not path.exists():
+            return None
+
+        # Try soundfile first (most accurate)
+        try:
+            import soundfile as sf
+            info = sf.info(str(path))
+            return info.duration
+        except Exception:
+            pass
+
+        # Try ffprobe as fallback
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(path)],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return float(result.stdout.strip())
+        except Exception:
+            pass
+
+        # Rough estimate from file size
+        # Assume ~16KB/s for compressed audio (128kbps MP3 / 256kbps OPUS)
+        size_bytes = path.stat().st_size
+        return size_bytes / 16000  # very rough
+
     def transcribe(
         self,
         audio_path: str,
@@ -106,6 +152,28 @@ class ASRClient:
         )
         return result["text"]
 
+    def _make_request_id(self, audio_path: str) -> str:
+        """Generate a deterministic request_id for result retrieval on retry."""
+        path = Path(audio_path)
+        raw = f"{path.name}_{time.time()}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _fetch_cached_result(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a previously completed transcription result by request_id.
+        Returns None if the result is not yet available or doesn't exist.
+        """
+        try:
+            resp = self.session.get(
+                f"{self.server_url}/v1/transcribe/result/{request_id}",
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
     def transcribe_full(
         self,
         audio_path: str,
@@ -115,6 +183,9 @@ class ASRClient:
         """
         完整转录 - 返回全部信息（文本、语言、耗时等）
 
+        自动生成 request_id 并在请求超时/失败时尝试从服务端缓存获取结果，
+        避免重复转录音频。
+
         返回:
             {
                 "text": "转录文本",
@@ -122,37 +193,63 @@ class ASRClient:
                 "processing_time": 1.23,
                 "segments": [...],
                 "duration_s": 60.5,
-                "rtf": 0.35
+                "rtf": 0.35,
+                "request_id": "abc123def456"
             }
         """
         path = Path(audio_path)
         if not path.exists():
             raise FileNotFoundError(f"音频文件不存在: {audio_path}")
 
-        file_size_mb = path.stat().st_size / 1024 / 1024
+        # ── 生成 request_id，用于超时后拉取缓存 ──────────────────
+        request_id = self._make_request_id(audio_path)
 
-        with open(audio_path, "rb") as f:
-            files = {"file": (path.name, f)}
-            data = {}
-            if language:
-                data["language"] = language
-            if word_timestamps:
-                data["word_timestamps"] = "true"
+        # ── 根据音频时长动态计算超时 ──────────────────────────────
+        # RTF ≈ 0.3，即 10分钟音频约需 3分钟处理
+        # 超时 = 音频时长 × 0.3(RTF) × 3(安全余量) + 30s 缓冲
+        duration_s = self._estimate_audio_duration(audio_path)
+        if duration_s and duration_s > 0:
+            estimated_processing_s = duration_s * 0.3
+            timeout = max(self.timeout, int(estimated_processing_s * 3) + 30)
+        else:
+            timeout = self.timeout
 
-            # 根据文件大小自动调整超时
-            # GGUF Vulkan 模式下，速度比 CPU 快 3-5 倍
-            # 公式: 文件大小(MB) × 60 ≈ 处理秒数 (保守估计)
-            timeout = max(self.timeout, int(file_size_mb * 60))
+        # ── 发起转录请求 ──────────────────────────────────────────
+        try:
+            with open(audio_path, "rb") as f:
+                files = {"file": (path.name, f)}
+                data = {"request_id": request_id}
+                if language:
+                    data["language"] = language
+                if word_timestamps:
+                    data["word_timestamps"] = "true"
 
-            resp = self.session.post(
-                f"{self.server_url}/v1/transcribe",
-                files=files,
-                data=data,
-                timeout=timeout
-            )
+                resp = self.session.post(
+                    f"{self.server_url}/v1/transcribe",
+                    files=files,
+                    data=data,
+                    timeout=timeout,
+                )
 
-        resp.raise_for_status()
-        return resp.json()
+            resp.raise_for_status()
+            return resp.json()
+
+        except Exception as e:
+            # ── 请求失败（超时/网络错误），尝试从缓存拉取结果 ──────
+            logger.warning("转录请求失败: %s，尝试从缓存拉取结果 (request_id=%s)", e, request_id)
+
+            # 轮询缓存：等待最多 2 分钟，每 5 秒检查一次
+            for attempt in range(24):
+                time.sleep(5)
+                cached = self._fetch_cached_result(request_id)
+                if cached is not None:
+                    logger.info("从缓存成功获取转录结果 (request_id=%s)", request_id)
+                    return cached
+                logger.info("等待转录完成... (attempt %d/24)", attempt + 1)
+
+            # 缓存中也找不到，抛出原始异常
+            logger.error("无法获取转录结果 (request_id=%s)，缓存中不存在", request_id)
+            raise
 
     def wait_for_service(self, max_wait: int = 60, check_interval: int = 2) -> bool:
         """

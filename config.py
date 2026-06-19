@@ -1,7 +1,7 @@
 """
 Configuration for Qwen3-ASR GGUF Server (AMD GPU + Vulkan)
 ===========================================================
-Based on llama-cpp-python with Vulkan acceleration.
+Based on llama.cpp's llama-server with Vulkan acceleration.
 Tuned for AMD GPU environments.
 """
 import os
@@ -12,12 +12,16 @@ MODEL_DIR = Path(os.getenv("ASR_MODEL_DIR", str(Path(__file__).parent / "model")
 MODEL_FILE = os.getenv("ASR_MODEL_FILE", "Qwen3-ASR-0.6B-Q8_0.gguf")
 MODEL_PATH = MODEL_DIR / MODEL_FILE
 
+# Audio projector (mmproj) file — required for Qwen3-ASR multimodal input
+MMPROJ_FILE = os.getenv("ASR_MMPROJ_FILE", "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf")
+MMPROJ_PATH = MODEL_DIR / MMPROJ_FILE
+
 # Default HuggingFace model for download
 HF_MODEL_REPO = os.getenv("ASR_HF_MODEL_REPO", "ggml-org/Qwen3-ASR-0.6B-GGUF")
 
 # ─── Vulkan/GPU Settings ─────────────────────────────────────────────────────
 # Enable Vulkan acceleration (requires Vulkan SDK and llama-cpp-python compiled with Vulkan)
-ENABLE_VULKAN = os.getenv("ASR_ENABLE_VULKAN", "true").lower() == "true"
+ENABLE_VULKAN = os.getenv("ASR_ENABLE_VULKAN", "false").lower() == "true"
 
 # Number of layers to offload to GPU (-1 = all layers)
 N_GPU_LAYERS = int(os.getenv("ASR_N_GPU_LAYERS", "-1"))
@@ -25,8 +29,15 @@ N_GPU_LAYERS = int(os.getenv("ASR_N_GPU_LAYERS", "-1"))
 # Vulkan backend selection (vulkan, cpu, metal, cuda)
 LLAMA_BACKEND = os.getenv("ASR_LLAMA_BACKEND", "vulkan" if ENABLE_VULKAN else "cpu")
 
-# ─── Llama.cpp Settings ──────────────────────────────────────────────────────
-# Context window size (in tokens)
+# ─── Llama-server Settings ───────────────────────────────────────────────────
+# Path to llama-server executable
+LLAMA_SERVER_BIN = Path(os.getenv("ASR_LLAMA_SERVER_BIN", str(Path(__file__).parent / "llama.cpp" / "build" / "bin" / "Release" / "llama-server.exe")))
+
+# llama-server listen address (internal)
+LLAMA_SERVER_HOST = os.getenv("ASR_LLAMA_SERVER_HOST", "127.0.0.1")
+LLAMA_SERVER_PORT = int(os.getenv("ASR_LLAMA_SERVER_PORT", "8080"))
+
+# Context window size (in tokens). Keep small to save GPU memory.
 N_CTX = int(os.getenv("ASR_N_CTX", "4096"))
 
 # Number of threads for CPU inference (0 = auto-detect)
@@ -106,10 +117,18 @@ def get_model_info() -> dict:
     if model_exists:
         model_size_mb = MODEL_PATH.stat().st_size / 1024 / 1024
 
+    mmproj_exists = MMPROJ_PATH.exists()
+    mmproj_size_mb = None
+    if mmproj_exists:
+        mmproj_size_mb = MMPROJ_PATH.stat().st_size / 1024 / 1024
+
     return {
         "model_path": str(MODEL_PATH),
         "model_exists": model_exists,
         "model_size_mb": round(model_size_mb, 2) if model_size_mb else None,
+        "mmproj_path": str(MMPROJ_PATH),
+        "mmproj_exists": mmproj_exists,
+        "mmproj_size_mb": round(mmproj_size_mb, 2) if mmproj_size_mb else None,
         "backend": LLAMA_BACKEND,
         "vulkan_enabled": ENABLE_VULKAN,
         "n_gpu_layers": N_GPU_LAYERS,
