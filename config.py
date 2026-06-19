@@ -52,10 +52,29 @@ N_MELS = int(os.getenv("ASR_N_MELS", "80"))
 N_FFT = int(os.getenv("ASR_N_FFT", "512"))
 
 # Chunk duration in seconds for long audio
-CHUNK_DURATION_S = int(os.getenv("ASR_CHUNK_DURATION_S", "30"))
+# Qwen3-ASR model processes ~10s of audio per inference call.
+CHUNK_DURATION_S = int(os.getenv("ASR_CHUNK_DURATION_S", "10"))
 
 # Pre-emphasis factor
 PRE_EMPHASIS = float(os.getenv("ASR_PRE_EMPHASIS", "0.97"))
+
+# ─── Chunk Processing (retry & timeout) ────────────────────────────────────
+# Per-chunk timeout in seconds (llama-server API call timeout)
+CHUNK_TIMEOUT = int(os.getenv("ASR_CHUNK_TIMEOUT", "120"))
+# Number of retries per failed chunk
+CHUNK_RETRIES = int(os.getenv("ASR_CHUNK_RETRIES", "2"))
+# Delay between retries in seconds
+CHUNK_RETRY_DELAY = int(os.getenv("ASR_CHUNK_RETRY_DELAY", "2"))
+# Max consecutive chunk failures before aborting
+MAX_CHUNK_FAILURES = int(os.getenv("ASR_MAX_CHUNK_FAILURES", "5"))
+# Proactively restart llama-server after every N chunks (0 = disable)
+CHUNKS_PER_RESTART = int(os.getenv("ASR_CHUNKS_PER_RESTART", "10"))
+
+# ─── ASR Model ──────────────────────────────────────────────────────────────
+# Max tokens per chunk response (increase for dense/long audio)
+N_PREDICT = int(os.getenv("ASR_N_PREDICT", "1024"))
+# Overlap between adjacent audio chunks (seconds) — prevents sentence breaks
+CHUNK_OVERLAP_S = float(os.getenv("ASR_CHUNK_OVERLAP_S", "0.2"))
 
 # ─── Server ────────────────────────────────────────────────────────────────
 HOST = os.getenv("ASR_HOST", "0.0.0.0")

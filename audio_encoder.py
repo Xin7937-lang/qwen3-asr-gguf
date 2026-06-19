@@ -74,19 +74,27 @@ def chunk_audio(
     sr: int = 16000,
     max_duration_s: float = 30.0,
     min_duration_s: float = 1.0,
+    overlap_s: float = 0.0,
 ) -> List[Tuple[int, float, float, bytes]]:
     """
-    Split audio into chunks and return WAV bytes for each chunk.
+    Split audio into overlapping chunks and return WAV bytes for each chunk.
+
+    Small overlap between adjacent chunks prevents text loss at sentence
+    boundaries. Overlapping text is deduplicated during segment assembly.
 
     Returns:
         List of (chunk_idx, start_s, end_s, wav_bytes)
     """
     chunk_samples = int(max_duration_s * sr)
+    overlap_samples = int(overlap_s * sr)
+    step_samples = chunk_samples - overlap_samples
+    if step_samples < 1:
+        step_samples = 1
     min_samples = int(min_duration_s * sr)
     total_samples = len(audio)
 
     chunks = []
-    for start in range(0, total_samples, chunk_samples):
+    for start in range(0, total_samples, step_samples):
         end = min(start + chunk_samples, total_samples)
         if end - start < min_samples:
             continue
@@ -99,7 +107,10 @@ def chunk_audio(
             wav_bytes,
         ))
 
-    logger.info("Split %ds audio into %d chunks (%.1fs each)", int(total_samples / sr), len(chunks), max_duration_s)
+    logger.info(
+        "Split %ds audio into %d chunks (%.1fs each, %.1fs overlap)",
+        int(total_samples / sr), len(chunks), max_duration_s, overlap_s,
+    )
     return chunks
 
 

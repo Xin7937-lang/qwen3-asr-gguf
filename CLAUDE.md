@@ -121,7 +121,14 @@ All `ASR_*` prefix. See `config.py` for the full list.
 | `ASR_ENABLE_VULKAN` | false | Enables Vulkan GPU acceleration |
 | `ASR_N_GPU_LAYERS` | -1 | GPU layers (-1 = all) |
 | `ASR_N_CTX` | 4096 | llama-server context window (tokens) |
-| `ASR_CHUNK_DURATION_S` | 30 | Audio chunk duration in seconds |
+| `ASR_CHUNK_DURATION_S` | 10 | Audio chunk duration in seconds (Qwen3-ASR max ~10s) |
+| `ASR_CHUNK_TIMEOUT` | 120 | Per-chunk llama-server API timeout (seconds) |
+| `ASR_CHUNK_RETRIES` | 2 | Number of retries per failed chunk |
+| `ASR_CHUNK_RETRY_DELAY` | 2 | Delay between chunk retries (seconds) |
+| `ASR_MAX_CHUNK_FAILURES` | 5 | Max consecutive chunk failures before abort |
+| `ASR_CHUNKS_PER_RESTART` | 10 | Proactively restart llama-server every N chunks (0=disable) |
+| `ASR_N_PREDICT` | 1024 | Max tokens per chunk response from llama-server |
+| `ASR_CHUNK_OVERLAP_S` | 2.0 | Audio overlap between adjacent chunks (seconds) |
 | `ASR_PORT` | 8001 | FastAPI public port |
 | `ASR_LLAMA_SERVER_PORT` | 8080 | Internal llama-server port |
 | `ASR_LLAMA_SERVER_BIN` | `llama.cpp/build/bin/Release/llama-server.exe` | Executable path |

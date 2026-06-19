@@ -184,7 +184,7 @@ def _stop_llama_server():
 
 
 def _wait_for_llama_server(timeout: float = 5.0) -> bool:
-    """Check if llama-server is responsive."""
+    """Check if llama-server is responsive (basic health check)."""
     url = f"{_llama_server_url()}/health"
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -196,6 +196,44 @@ def _wait_for_llama_server(timeout: float = 5.0) -> bool:
             pass
         time.sleep(0.2)
     return False
+
+
+def _probe_llama_server() -> bool:
+    """Deep probe: check if llama-server can actually process a request.
+
+    Sends a minimal text-only request rather than just pinging /health,
+    which can return 200 even when the inference endpoint is hung.
+    """
+    try:
+        payload = {
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0.0,
+            "n_predict": 1,
+            "stop": ["<|im_end|>"],
+        }
+        r = requests.post(
+            f"{_llama_server_url()}/v1/chat/completions",
+            json=payload,
+            timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _restart_llama_server() -> bool:
+    """Restart the llama-server subprocess."""
+    global _llama_server_proc
+    logger.info("Restarting llama-server...")
+    _stop_llama_server()
+    time.sleep(1)
+    try:
+        _start_llama_server()
+        logger.info("llama-server restarted successfully")
+        return True
+    except Exception as e:
+        logger.error("Failed to restart llama-server: %s", e)
+        return False
 
 
 # ─── Transcription via llama-server ──────────────────────────────────────
@@ -224,7 +262,13 @@ def _make_request_id(filename: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def _transcribe_chunk(chunk_idx: int, wav_bytes: bytes, start_s: float, end_s: float) -> dict:
+def _transcribe_chunk(
+    chunk_idx: int,
+    wav_bytes: bytes,
+    start_s: float,
+    end_s: float,
+    timeout: int = 300,
+) -> dict:
     """Send one audio chunk to llama-server and return a segment."""
     audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
     payload = {
@@ -241,12 +285,12 @@ def _transcribe_chunk(chunk_idx: int, wav_bytes: bytes, start_s: float, end_s: f
             }
         ],
         "temperature": 0.0,
-        "n_predict": 512,
+        "n_predict": config.N_PREDICT,
         "stop": ["<|im_end|>"],
     }
 
     url = f"{_llama_server_url()}/v1/chat/completions"
-    r = requests.post(url, json=payload, timeout=300)
+    r = requests.post(url, json=payload, timeout=timeout)
     if r.status_code != 200:
         raise RuntimeError(f"llama-server error {r.status_code}: {r.text}")
 
@@ -273,6 +317,45 @@ def _transcribe_chunk(chunk_idx: int, wav_bytes: bytes, start_s: float, end_s: f
     }
 
 
+def _merge_segments(segments: list) -> str:
+    """
+    Merge segment texts, deduplicating overlapping content between adjacent chunks.
+
+    With overlapping audio chunks, the same text may appear at the end of
+    one segment and the start of the next. This function trims duplicates.
+    """
+    if not segments:
+        return ""
+
+    texts = [segments[0]["text"]]
+    for i in range(1, len(segments)):
+        prev = texts[-1]
+        curr = segments[i]["text"]
+        merged = _dedup_overlap(prev, curr)
+        texts.append(merged)
+
+    return "".join(texts).strip()
+
+
+def _dedup_overlap(prev: str, curr: str, min_overlap: int = 5) -> str:
+    """
+    Trim overlapping prefix from `curr` if it matches the suffix of `prev`.
+
+    Example:
+        prev = "那我也没办法。只要"
+        curr = "只要我们应该增加社会福利"
+        → "我们应该增加社会福利"  (trim "只要")
+    """
+    # Try longest overlap first (up to 40 chars ≈ 2s of speech)
+    max_check = min(len(prev), len(curr), 40)
+    for overlap_len in range(max_check, min_overlap - 1, -1):
+        suffix = prev[-overlap_len:]
+        prefix = curr[:overlap_len]
+        if suffix == prefix:
+            return curr[overlap_len:]
+    return curr
+
+
 def _transcribe_llama_server(
     audio_bytes: bytes,
     language: Optional[str] = None,
@@ -289,24 +372,79 @@ def _transcribe_llama_server(
     # Load and resample to 16kHz mono
     audio, sr = audio_encoder.load_audio(audio_bytes, target_sr=config.SAMPLE_RATE)
 
-    # Chunk audio into ~30s WAV segments
-    chunks = audio_encoder.chunk_audio(audio, sr=sr, max_duration_s=config.CHUNK_DURATION_S)
+    # Chunk audio into ~30s WAV segments with overlap
+    chunks = audio_encoder.chunk_audio(
+        audio, sr=sr, max_duration_s=config.CHUNK_DURATION_S,
+        overlap_s=config.CHUNK_OVERLAP_S,
+    )
 
     segments = []
     detected_lang = normalize_language(language)
     t_start = time.time()
+    consecutive_failures = 0
+    max_consecutive_failures = getattr(config, "MAX_CHUNK_FAILURES", 5)
+    chunk_timeout = getattr(config, "CHUNK_TIMEOUT", 120)
+    chunks_per_restart = getattr(config, "CHUNKS_PER_RESTART", 10)
+    chunks_since_restart = 0
 
     for idx, start_s, end_s, wav_bytes in chunks:
         t_chunk = time.time()
-        try:
-            segment = _transcribe_chunk(idx, wav_bytes, start_s, end_s)
+
+        # ── Proactive restart: prevent state accumulation ─────────────
+        if chunks_per_restart > 0 and chunks_since_restart >= chunks_per_restart:
+            logger.info("Processed %d chunks, proactively restarting llama-server...", chunks_per_restart)
+            _restart_llama_server()
+            chunks_since_restart = 0
+
+        # ── After any failure, deep-probe and force restart ──────────
+        if consecutive_failures > 0:
+            if not _probe_llama_server():
+                logger.warning("llama-server deep probe failed after chunk %d, restarting...", idx)
+                if not _restart_llama_server():
+                    raise RuntimeError("llama-server failed to restart, aborting transcription")
+            else:
+                # Server responds to chat but chunk still failed — force restart anyway
+                logger.warning("llama-server responsive but chunk %d failed, restarting for safety...", idx)
+                _restart_llama_server()
+            consecutive_failures = 0
+
+        # ── Retry loop for each chunk ────────────────────────────────
+        # Use full timeout on first attempt, shorter on retries
+        segment = None
+        retry_timeout = max(chunk_timeout // 2, 30)
+        for attempt in range(config.CHUNK_RETRIES + 1):
+            try:
+                to = chunk_timeout if attempt == 0 else retry_timeout
+                segment = _transcribe_chunk(idx, wav_bytes, start_s, end_s, timeout=to)
+                break
+            except Exception as e:
+                logger.warning(
+                    "Chunk %d/%d (%.1fs-%.1fs) attempt %d/%d failed: %s",
+                    idx + 1, len(chunks), start_s, end_s,
+                    attempt + 1, config.CHUNK_RETRIES + 1, e,
+                )
+                if attempt < config.CHUNK_RETRIES:
+                    time.sleep(config.CHUNK_RETRY_DELAY)
+
+        if segment is not None:
             text = segment["text"]
             if segment.get("language"):
                 detected_lang = normalize_language(segment["language"]) or detected_lang
-        except Exception as e:
-            logger.warning("Chunk %d failed: %s", idx + 1, e)
+            consecutive_failures = 0
+            chunks_since_restart += 1
+        else:
+            logger.error("Chunk %d/%d failed after all retries", idx + 1, len(chunks))
             text = ""
             segment = {"start": start_s, "end": end_s, "text": "", "language": None}
+            consecutive_failures += 1
+
+        # ── Abort if too many consecutive failures ───────────────────
+        if consecutive_failures >= max_consecutive_failures:
+            logger.error(
+                "%d consecutive chunk failures, aborting transcription",
+                consecutive_failures,
+            )
+            break
 
         chunk_dur = time.time() - t_chunk
         if text:
@@ -317,7 +455,7 @@ def _transcribe_llama_server(
             )
 
     total_time = time.time() - t_start
-    full_text = " ".join(s["text"] for s in segments).strip()
+    full_text = _merge_segments(segments)
     rtf = total_time / duration_s if duration_s > 0 else 0
 
     logger.info(
