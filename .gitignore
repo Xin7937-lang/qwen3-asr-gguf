@@ -43,6 +43,7 @@ output/
 # Test Audio & Results
 test*.wav
 test.mp3
+[0-9]*.mp3
 test_output*.txt
 api_test_output.txt
 api_gpu_output.txt
