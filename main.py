@@ -98,6 +98,7 @@ def normalize_language(lang: str | None) -> str | None:
 
 # ─── llama-server subprocess ─────────────────────────────────────────────
 _llama_server_proc: Optional[subprocess.Popen] = None
+_llama_server_log: Optional[object] = None  # file handle for stdout log
 
 
 def _llama_server_url() -> str:
@@ -136,9 +137,13 @@ def _start_llama_server() -> subprocess.Popen:
 
     logger.info("Starting llama-server: %s", " ".join(cmd))
     t0 = time.time()
+    # Write logs to file instead of PIPE to avoid pipe buffer deadlock
+    # (Windows pipe buffer is ~4KB; filling it blocks the subprocess)
+    global _llama_server_log
+    _llama_server_log = open("llama-server.log", "a", encoding="utf-8")
     _llama_server_proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=_llama_server_log,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
@@ -169,7 +174,7 @@ def _start_llama_server() -> subprocess.Popen:
 
 def _stop_llama_server():
     """Stop the llama-server subprocess."""
-    global _llama_server_proc
+    global _llama_server_proc, _llama_server_log
     if _llama_server_proc is not None:
         logger.info("Stopping llama-server")
         try:
@@ -181,6 +186,12 @@ def _stop_llama_server():
             except Exception:
                 pass
         _llama_server_proc = None
+    if _llama_server_log is not None:
+        try:
+            _llama_server_log.close()
+        except Exception:
+            pass
+        _llama_server_log = None
 
 
 def _wait_for_llama_server(timeout: float = 5.0) -> bool:
@@ -198,42 +209,6 @@ def _wait_for_llama_server(timeout: float = 5.0) -> bool:
     return False
 
 
-def _probe_llama_server() -> bool:
-    """Deep probe: check if llama-server can actually process a request.
-
-    Sends a minimal text-only request rather than just pinging /health,
-    which can return 200 even when the inference endpoint is hung.
-    """
-    try:
-        payload = {
-            "messages": [{"role": "user", "content": "ping"}],
-            "temperature": 0.0,
-            "n_predict": 1,
-            "stop": ["<|im_end|>"],
-        }
-        r = requests.post(
-            f"{_llama_server_url()}/v1/chat/completions",
-            json=payload,
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def _restart_llama_server() -> bool:
-    """Restart the llama-server subprocess."""
-    global _llama_server_proc
-    logger.info("Restarting llama-server...")
-    _stop_llama_server()
-    time.sleep(1)
-    try:
-        _start_llama_server()
-        logger.info("llama-server restarted successfully")
-        return True
-    except Exception as e:
-        logger.error("Failed to restart llama-server: %s", e)
-        return False
 
 
 # ─── Transcription via llama-server ──────────────────────────────────────
@@ -384,29 +359,9 @@ def _transcribe_llama_server(
     consecutive_failures = 0
     max_consecutive_failures = getattr(config, "MAX_CHUNK_FAILURES", 5)
     chunk_timeout = getattr(config, "CHUNK_TIMEOUT", 120)
-    chunks_per_restart = getattr(config, "CHUNKS_PER_RESTART", 10)
-    chunks_since_restart = 0
 
     for idx, start_s, end_s, wav_bytes in chunks:
         t_chunk = time.time()
-
-        # ── Proactive restart: prevent state accumulation ─────────────
-        if chunks_per_restart > 0 and chunks_since_restart >= chunks_per_restart:
-            logger.info("Processed %d chunks, proactively restarting llama-server...", chunks_per_restart)
-            _restart_llama_server()
-            chunks_since_restart = 0
-
-        # ── After any failure, deep-probe and force restart ──────────
-        if consecutive_failures > 0:
-            if not _probe_llama_server():
-                logger.warning("llama-server deep probe failed after chunk %d, restarting...", idx)
-                if not _restart_llama_server():
-                    raise RuntimeError("llama-server failed to restart, aborting transcription")
-            else:
-                # Server responds to chat but chunk still failed — force restart anyway
-                logger.warning("llama-server responsive but chunk %d failed, restarting for safety...", idx)
-                _restart_llama_server()
-            consecutive_failures = 0
 
         # ── Retry loop for each chunk ────────────────────────────────
         # Use full timeout on first attempt, shorter on retries
@@ -431,7 +386,6 @@ def _transcribe_llama_server(
             if segment.get("language"):
                 detected_lang = normalize_language(segment["language"]) or detected_lang
             consecutive_failures = 0
-            chunks_since_restart += 1
         else:
             logger.error("Chunk %d/%d failed after all retries", idx + 1, len(chunks))
             text = ""

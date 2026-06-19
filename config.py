@@ -67,8 +67,6 @@ CHUNK_RETRIES = int(os.getenv("ASR_CHUNK_RETRIES", "2"))
 CHUNK_RETRY_DELAY = int(os.getenv("ASR_CHUNK_RETRY_DELAY", "2"))
 # Max consecutive chunk failures before aborting
 MAX_CHUNK_FAILURES = int(os.getenv("ASR_MAX_CHUNK_FAILURES", "5"))
-# Proactively restart llama-server after every N chunks (0 = disable)
-CHUNKS_PER_RESTART = int(os.getenv("ASR_CHUNKS_PER_RESTART", "10"))
 
 # ─── ASR Model ──────────────────────────────────────────────────────────────
 # Max tokens per chunk response (increase for dense/long audio)
