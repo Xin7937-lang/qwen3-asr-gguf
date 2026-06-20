@@ -20,8 +20,28 @@ MMPROJ_PATH = MODEL_DIR / MMPROJ_FILE
 HF_MODEL_REPO = os.getenv("ASR_HF_MODEL_REPO", "ggml-org/Qwen3-ASR-0.6B-GGUF")
 
 # ─── Vulkan/GPU Settings ─────────────────────────────────────────────────────
-# Enable Vulkan acceleration (requires Vulkan SDK and llama-cpp-python compiled with Vulkan)
-ENABLE_VULKAN = os.getenv("ASR_ENABLE_VULKAN", "false").lower() == "true"
+# Enable Vulkan acceleration (requires Vulkan SDK / vulkan-1.dll on PATH)
+# Auto-detected by default: checks vulkaninfo, VULKAN_SDK, or vulkan-1.dll
+
+def _detect_vulkan() -> bool:
+    """Auto-detect Vulkan SDK availability."""
+    import shutil
+    # 1. vulkaninfo on PATH (most reliable)
+    if shutil.which("vulkaninfo") is not None:
+        return True
+    # 2. VULKAN_SDK env var (set by Vulkan SDK installer)
+    if os.environ.get("VULKAN_SDK"):
+        return True
+    # 3. vulkan-1.dll in system32 (Vulkan runtime)
+    if os.name == "nt" and os.path.exists(os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "vulkan-1.dll")):
+        return True
+    return False
+
+_ENV_OVERRIDE = os.getenv("ASR_ENABLE_VULKAN")
+if _ENV_OVERRIDE is not None:
+    ENABLE_VULKAN = _ENV_OVERRIDE.lower() == "true"
+else:
+    ENABLE_VULKAN = _detect_vulkan()
 
 # Number of layers to offload to GPU (-1 = all layers)
 N_GPU_LAYERS = int(os.getenv("ASR_N_GPU_LAYERS", "-1"))

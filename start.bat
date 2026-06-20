@@ -44,19 +44,39 @@ if errorlevel 1 (
 
 REM ─── Check Vulkan environment ───────────────────────────────────────────
 echo [4/6] Checking Vulkan support...
+
+set ASR_ENABLE_VULKAN=false
+
+REM Check via vulkaninfo (most reliable)
 vulkaninfo --version >nul 2>&1
-if errorlevel 1 (
-    echo [WARNING] Vulkan SDK not detected
-    echo.
-    echo          Without Vulkan SDK, server will run in CPU-only mode.
-    echo          For AMD GPU acceleration, install Vulkan SDK:
-    echo          https://vulkan.lunarg.com/
-    echo.
-    set ASR_ENABLE_VULKAN=false
-) else (
-    echo [OK] Vulkan SDK detected
+if not errorlevel 1 (
+    echo [OK] Vulkan SDK detected (vulkaninfo)
     set ASR_ENABLE_VULKAN=true
+    goto :vulkan_done
 )
+
+REM Fallback: check VULKAN_SDK env var (set by Vulkan SDK installer)
+if not "%VULKAN_SDK%"=="" (
+    echo [OK] Vulkan SDK detected (VULKAN_SDK=%VULKAN_SDK%)
+    set ASR_ENABLE_VULKAN=true
+    goto :vulkan_done
+)
+
+REM Fallback: check for vulkan-1.dll in system path
+if exist "%SystemRoot%\System32\vulkan-1.dll" (
+    echo [OK] Vulkan detected (vulkan-1.dll)
+    set ASR_ENABLE_VULKAN=true
+    goto :vulkan_done
+)
+
+echo [WARNING] Vulkan SDK not detected
+echo.
+echo          Without Vulkan SDK, server will run in CPU-only mode.
+echo          For AMD GPU acceleration, install Vulkan SDK:
+echo          https://vulkan.lunarg.com/
+echo.
+
+:vulkan_done
 
 REM ─── Check model ──────────────────────────────────────────────────────
 echo [5/6] Checking model...

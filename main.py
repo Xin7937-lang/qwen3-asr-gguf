@@ -221,6 +221,9 @@ _QWEN3_ASR_RE = re.compile(r"language\s+(?P<lang>\S+?)<asr_text>(?P<text>.*)", r
 _result_cache: dict[str, dict] = {}
 _RESULT_CACHE_MAX = 50
 
+# Active request tracking — used for busy-status reporting
+_active_requests: dict[str, dict] = {}  # request_id -> {filename, start_time}
+
 
 def _cache_put(request_id: str, result: dict):
     """Store a transcription result for later retrieval by the agent."""
@@ -581,6 +584,19 @@ async def root():
             "n_ctx": config.N_CTX,
             "chunk_duration_s": config.CHUNK_DURATION_S,
         },
+        "transcription_slots": {
+            "max_concurrency": config.MAX_CONCURRENCY,
+            "active_count": len(_active_requests),
+            "available": config.MAX_CONCURRENCY - len(_active_requests),
+            "active_requests": [
+                {
+                    "request_id": rid,
+                    "filename": info.get("filename"),
+                    "elapsed_s": round(time.time() - info["start_time"], 1),
+                }
+                for rid, info in _active_requests.items()
+            ],
+        },
     }
 
 
@@ -617,53 +633,83 @@ async def transcribe(
     # Use client's request_id or generate one
     rid = request_id or _make_request_id(file.filename)
 
-    async with _transcribe_semaphore:
-        start_time = time.time()
+    # Try to acquire a transcription slot without blocking;
+    # return 503 immediately if all slots are occupied.
+    if _transcribe_semaphore._value <= 0:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "server_busy",
+                "message": (
+                    f"All {config.MAX_CONCURRENCY} transcription slots are occupied. "
+                    f"Active requests: {len(_active_requests)}. Please retry."
+                ),
+                "active_requests": [
+                    {
+                        "request_id": rid,
+                        "filename": info.get("filename"),
+                        "elapsed_s": round(time.time() - info["start_time"], 1),
+                    }
+                    for rid, info in _active_requests.items()
+                ],
+                "max_concurrency": config.MAX_CONCURRENCY,
+            },
+            headers={"Retry-After": "60"},
+        )
 
-        try:
-            content = await file.read()
-            file_size_mb = len(content) / 1024 / 1024
-            logger.info("Request: file=%s size=%.1fMB backend=%s request_id=%s",
-                        file.filename, file_size_mb, config.LLAMA_BACKEND, rid)
+    await _transcribe_semaphore.acquire()
 
-            result = _transcribe_llama_server(content, language=language, word_timestamps=word_timestamps)
+    # Register as active request for status reporting
+    start_time = time.time()
+    _active_requests[rid] = {"filename": file.filename, "start_time": start_time}
 
-            processing_time = time.time() - start_time
-            logger.info("Done in %.1fs: %s", processing_time, result["text"][:80])
+    try:
+        content = await file.read()
+        file_size_mb = len(content) / 1024 / 1024
+        logger.info("Request: file=%s size=%.1fMB backend=%s request_id=%s",
+                    file.filename, file_size_mb, config.LLAMA_BACKEND, rid)
 
-            segments = result.get("segments", [])
-            _save_result(file.filename, result["text"], result, segments, processing_time)
+        result = _transcribe_llama_server(content, language=language, word_timestamps=word_timestamps)
 
-            # Cache for agent retry
-            cached = {
-                "text": result["text"],
-                "language": result.get("language"),
-                "segments": result.get("segments") if word_timestamps else [],
-                "processing_time": processing_time,
-                "duration_s": result.get("duration_s"),
-                "rtf": result.get("rtf"),
-                "request_id": rid,
-            }
-            _cache_put(rid, cached)
+        processing_time = time.time() - start_time
+        logger.info("Done in %.1fs: %s", processing_time, result["text"][:80])
 
-            return TranscribeResponse(
-                text=result["text"],
-                language=result.get("language"),
-                segments=result.get("segments") if word_timestamps else None,
-                processing_time=processing_time,
-                duration_s=result.get("duration_s"),
-                rtf=result.get("rtf"),
-                request_id=rid,
-            )
+        segments = result.get("segments", [])
+        _save_result(file.filename, result["text"], result, segments, processing_time)
 
-        except HTTPException:
-            raise
-        except FileNotFoundError as e:
-            logger.error("Model/mmproj not found: %s", e)
-            raise HTTPException(500, f"Model/mmproj not found: {e}")
-        except Exception as e:
-            logger.exception("Transcription failed")
-            raise HTTPException(500, f"Transcription failed: {e}")
+        # Cache for agent retry
+        cached = {
+            "text": result["text"],
+            "language": result.get("language"),
+            "segments": result.get("segments") if word_timestamps else [],
+            "processing_time": processing_time,
+            "duration_s": result.get("duration_s"),
+            "rtf": result.get("rtf"),
+            "request_id": rid,
+        }
+        _cache_put(rid, cached)
+
+        return TranscribeResponse(
+            text=result["text"],
+            language=result.get("language"),
+            segments=result.get("segments") if word_timestamps else None,
+            processing_time=processing_time,
+            duration_s=result.get("duration_s"),
+            rtf=result.get("rtf"),
+            request_id=rid,
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        logger.error("Model/mmproj not found: %s", e)
+        raise HTTPException(500, f"Model/mmproj not found: {e}")
+    except Exception as e:
+        logger.exception("Transcription failed")
+        raise HTTPException(500, f"Transcription failed: {e}")
+    finally:
+        _active_requests.pop(rid, None)
+        _transcribe_semaphore.release()
 
 
 @app.post("/asr")

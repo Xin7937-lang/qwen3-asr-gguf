@@ -214,42 +214,92 @@ class ASRClient:
         else:
             timeout = self.timeout
 
-        # ── 发起转录请求 ──────────────────────────────────────────
-        try:
-            with open(audio_path, "rb") as f:
-                files = {"file": (path.name, f)}
-                data = {"request_id": request_id}
-                if language:
-                    data["language"] = language
-                if word_timestamps:
-                    data["word_timestamps"] = "true"
+        # ── 发起转录请求（含 503 服务繁忙重试）────────────────────
+        MAX_BUSY_RETRIES = 12  # 最多重试 12 次（~2 分钟）
 
-                resp = self.session.post(
-                    f"{self.server_url}/v1/transcribe",
-                    files=files,
-                    data=data,
-                    timeout=timeout,
-                )
+        for attempt in range(MAX_BUSY_RETRIES + 1):
+            try:
+                with open(audio_path, "rb") as f:
+                    files = {"file": (path.name, f)}
+                    data = {"request_id": request_id}
+                    if language:
+                        data["language"] = language
+                    if word_timestamps:
+                        data["word_timestamps"] = "true"
 
-            resp.raise_for_status()
-            return resp.json()
+                    resp = self.session.post(
+                        f"{self.server_url}/v1/transcribe",
+                        files=files,
+                        data=data,
+                        timeout=timeout,
+                    )
 
-        except Exception as e:
-            # ── 请求失败（超时/网络错误），尝试从缓存拉取结果 ──────
-            logger.warning("转录请求失败: %s，尝试从缓存拉取结果 (request_id=%s)", e, request_id)
+                # ── 503 — 服务忙，等 Retry-After 后重试 ────────────
+                if resp.status_code == 503:
+                    detail = {}
+                    try:
+                        detail = resp.json()
+                    except Exception:
+                        pass
+                    retry_after = int(resp.headers.get("Retry-After", 30))
+                    retry_after = max(10, min(retry_after, 120))
+                    busy_info = detail.get("active_requests", [])
+                    max_conc = detail.get("max_concurrency", "?")
+                    logger.warning(
+                        "ASR 服务繁忙: %d/%s 槽位已占用, %ds 后重试 (attempt %d/%d)",
+                        len(busy_info), max_conc,
+                        retry_after, attempt + 1, MAX_BUSY_RETRIES,
+                    )
+                    time.sleep(retry_after)
+                    continue
 
-            # 轮询缓存：等待最多 2 分钟，每 5 秒检查一次
-            for attempt in range(24):
-                time.sleep(5)
-                cached = self._fetch_cached_result(request_id)
-                if cached is not None:
-                    logger.info("从缓存成功获取转录结果 (request_id=%s)", request_id)
-                    return cached
-                logger.info("等待转录完成... (attempt %d/24)", attempt + 1)
+                resp.raise_for_status()
+                return resp.json()
 
-            # 缓存中也找不到，抛出原始异常
-            logger.error("无法获取转录结果 (request_id=%s)，缓存中不存在", request_id)
-            raise
+            except requests.exceptions.HTTPError as e:
+                # 503 via raise_for_status — 同上处理
+                if e.response is not None and e.response.status_code == 503:
+                    retry_after = int(e.response.headers.get("Retry-After", 30))
+                    retry_after = max(10, min(retry_after, 120))
+                    logger.warning(
+                        "ASR 服务繁忙, %ds 后重试 (attempt %d/%d)",
+                        retry_after, attempt + 1, MAX_BUSY_RETRIES,
+                    )
+                    time.sleep(retry_after)
+                    continue
+                raise  # 其他 HTTP 错误直接抛
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                # ── 超时/网络错误 — 从缓存拉取结果 ────────────────
+                logger.warning("转录请求失败: %s，尝试从缓存拉取结果 (request_id=%s)", e, request_id)
+
+                for poll_attempt in range(24):
+                    time.sleep(5)
+                    cached = self._fetch_cached_result(request_id)
+                    if cached is not None:
+                        logger.info("从缓存成功获取转录结果 (request_id=%s)", request_id)
+                        return cached
+                    logger.info("等待转录完成... (attempt %d/24)", poll_attempt + 1)
+
+                logger.error("无法获取转录结果 (request_id=%s)，缓存中不存在", request_id)
+                raise
+
+            except Exception as e:
+                # ── 其他异常 — 也尝试从缓存拉取 ────────────────────
+                logger.warning("转录请求异常: %s，尝试从缓存拉取结果 (request_id=%s)", e, request_id)
+                for poll_attempt in range(24):
+                    time.sleep(5)
+                    cached = self._fetch_cached_result(request_id)
+                    if cached is not None:
+                        logger.info("从缓存成功获取转录结果 (request_id=%s)", request_id)
+                        return cached
+                raise
+
+        # 所有忙重试用完，依然失败
+        raise RuntimeError(
+            f"ASR 服务持续繁忙，{MAX_BUSY_RETRIES} 次重试后仍未有空闲槽位。"
+            f"请稍后重试或增加 ASR_MAX_CONCURRENCY 配置。"
+        )
 
     def wait_for_service(self, max_wait: int = 60, check_interval: int = 2) -> bool:
         """
